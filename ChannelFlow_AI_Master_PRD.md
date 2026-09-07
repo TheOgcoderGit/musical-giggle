@@ -3450,3 +3450,151 @@ A feature may only be marked `VERIFIED` after actual testing.
 
 **The goal is not to make the code look complete. The goal is to make
 the product actually work end-to-end.**
+
+------------------------------------------------------------------------
+
+# 92. UX-NAV-01 --- Unified Onboarding & Navigation UX
+
+> **Source:** Product owner UX requirement (2026-09-07). Status: TODO.
+> One tracked feature: language-first onboarding, account-state-aware
+> main menus, contextual Back/Home, inline-keyboard policy, i18n.
+
+## 92.1 /start language selection
+- First `/start` for a user without a saved language preference shows
+  a language choice screen (`🌐 Choose your preferred language`).
+- Supported: English (`en`) and Hinglish (`hi`) per the existing i18n
+  system; other existing i18n languages remain available where
+  already implemented.
+- Selection persists; the bot must not ask again unnecessarily.
+- Users with a saved language skip selection and go straight to the
+  appropriate Main Menu.
+
+## 92.2 First-time Main Menu (unconnected)
+- Show a contextual welcome/header message WITH the menu (never only
+  buttons).
+- Primary actions before account connection: Connect Account,
+  Why Connect, Subscription/Plans, How It Works, Support.
+- Do not expose advanced project controls that cannot work before
+  account connection.
+
+## 92.3 Connected Main Menu
+- After successful account connection the Main Menu becomes the
+  authenticated experience and must not require the user to rediscover
+  sections: Projects, Subscription, Rewards, Account, Support,
+  Settings.
+- Menu indicates account status (e.g. `🔗 Account: Connected`).
+- If the account becomes disconnected the menu automatically returns
+  to the unconnected state; no connected-only buttons remain visible.
+
+## 92.4 Back + Home navigation
+- Every meaningful inner screen (Projects, Project/Task details,
+  creation steps, filters/formatting/AI/watermark/affiliate settings,
+  analytics, subscription, payment, rewards, account, connected
+  accounts, support, settings, notifications, configuration) provides
+  contextual `◀️ Back` and `🏠 Home`.
+- Back returns to the correct previous screen (never a bot restart);
+  Home returns safely to the appropriate Main Menu for the current
+  account state without destroying persistent configuration or
+  canceling legitimate active operations.
+
+## 92.5 Inline keyboard policy
+- Persistent/reply keyboard: primary navigation.
+- Inline keyboards: contextual actions only (selection, confirmation,
+  toggles, payment/plan selection, pagination, destructive
+  confirmations, multi-step configuration).
+- Avoid giant walls of inline buttons and duplicated Back/Home rows.
+
+## 92.6 Centralized navigation state (user-isolated)
+- One consistent navigation approach; no random per-handler Back/Home.
+- Per-user navigation state (current screen, previous screen, current
+  bot message id, task/project context); never global state shared
+  across users.
+- Callback navigation validates user + project/task ownership; stale
+  callbacks must not modify another user's state and get a safe
+  "screen expired → Home" response.
+
+## 92.7 i18n + /start idempotency
+- All new navigation/welcome/status strings go through the i18n system
+  (English + Hinglish).
+- `/start` is idempotent: repeated runs never duplicate users,
+  re-grant the trial, reset language, duplicate projects/sessions, or
+  replay onboarding; it shows the current appropriate state.
+
+------------------------------------------------------------------------
+
+# 93. UX-NAV-02 --- Task-First Navigation & Message Lifecycle
+
+> **Source:** Product owner UX requirement (2026-09-07). Status: TODO.
+> Counts as ONE feature. Projects surface as "tasks" with a list-first
+> screen, per-user screen stack, and message edit/delete lifecycle to
+> reduce chat clutter.
+
+## 93.1 Task list first + empty state
+- `📁 Projects` opens the task list FIRST (each project rendered as a
+  task with status), then contextual actions (New Task / Edit / Delete
+  / Start-Pause / Analytics / Settings).
+- Zero tasks -> clean empty state with `🚀 Create Your First Task`
+  (starts creation flow) and no irrelevant Edit/Delete buttons.
+
+## 93.2 Task creation / edit flows
+- Creation: name -> source -> destination -> filters -> formatting ->
+  AI -> watermark/affiliate where applicable -> review -> create,
+  matching the existing PRD implementation; Back returns to the actual
+  previous step; Home is safe; already-entered configuration is not
+  lost unless the user explicitly cancels.
+- Edit shows the task's current configuration grouped by area, each
+  area with Back/Home; after saving, return to the Task Details
+  screen.
+- Delete requires confirmation; deletion validates ownership, refreshes
+  the task list, and shows the empty state when the last task is
+  deleted.
+- Task Details is compact: status + source/destination summary + Edit /
+  Start-Pause / Analytics / Delete + Back/Home. Advanced controls live
+  in subsections, never dead buttons.
+
+## 93.3 Message lifecycle / screen replacement
+- The bot must not spam the chat with a duplicate permanent message on
+  every navigation step. Interactive UI messages are edited/replaced
+  in place where Telegram allows (track per-user current screen +
+  bot message id); when editing is impossible, delete the obsolete bot
+  UI message (never user messages) and send the replacement; update
+  navigation state to the new message id. On Telegram edit errors the
+  handler falls back safely without crashing.
+- Categories: (A) interactive UI messages -> replace/edit;
+  (B) important confirmations/results (task created, payment success,
+  connection success, critical errors) -> may remain;
+  (C) sensitive/temporary login UI (OTP/2FA/connecting prompts) ->
+  cleaned up best-effort after the flow finishes; OTP/2FA values are
+  never stored or logged, and cleanup failure never fails the login.
+
+## 93.4 Navigation architecture
+- Per-user navigation stack with isolated state: Home -> Projects ->
+  Task list -> Task details -> Edit/settings -> subsections; Back walks
+  the stack, Home returns to the correct Main Menu for the account
+  state. Root-level Back may return Home. Confirmation dialogs use
+  Cancel instead of Back where appropriate.
+- Stale callbacks (old screen, wrong user, changed ownership) are
+  rejected with a safe "screen expired" response plus a way Home.
+
+## 93.5 i18n
+- All new strings (Your Tasks, Create Your First Task, New/Edit/Delete
+  Task, Confirm Delete, Task Details, Start, Pause, Back, Home, Screen
+  expired, Task created/deleted, Account connected, success/error
+  text) go through the i18n system; English + Hinglish. No scattered
+  hard-coded language strings.
+
+------------------------------------------------------------------------
+
+# 94. UX-Nav Discovered Improvements (Backlog)
+
+> Items found during navigation audits that are NOT yet implemented.
+> Status of every item below: TODO. They are documented for future
+> batches and must not be implemented silently out of order.
+
+- UX-NAV-03: Pagination/search for long task lists.
+- UX-NAV-04: Plan-locked feature states with contextual Upgrade CTA
+  (replace generic "locked" alerts).
+- UX-NAV-05: Consistent loading/progress + success/error state
+  messages across all flows.
+- UX-NAV-06: First-use onboarding hints inside sections (guide chips
+  on empty screens).
