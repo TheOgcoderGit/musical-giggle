@@ -186,6 +186,12 @@ def _migrate_existing_schema(cur):
     if not _column_exists(cur, "users", "language"):
         cur.execute("ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'en'")
 
+    # UX-NAV-01: whether the user has ever picked a language. 0 (the
+    # default for pre-existing rows) makes /start show the language
+    # picker exactly once, then persist the choice.
+    if not _column_exists(cur, "users", "language_chosen"):
+        cur.execute("ALTER TABLE users ADD COLUMN language_chosen INTEGER NOT NULL DEFAULT 0")
+
     # User last name (Telegram profile)
     if not _column_exists(cur, "users", "last_name"):
         cur.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
@@ -415,6 +421,7 @@ def init_db():
         first_name TEXT,
         last_name TEXT,
         language TEXT NOT NULL DEFAULT 'en',
+        language_chosen INTEGER NOT NULL DEFAULT 0,
         is_admin INTEGER NOT NULL DEFAULT 0,
         plan TEXT NOT NULL DEFAULT 'FREE',
         plan_expiry TIMESTAMP,

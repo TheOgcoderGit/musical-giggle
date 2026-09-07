@@ -183,6 +183,69 @@ _STRINGS = {
         "ar": "حدث خطأ أثناء إعادة التوجيه. يرجى المحاولة مرة أخرى.",
         "id": "Terjadi kesalahan saat meneruskan. Silakan coba lagi.",
     },
+
+    "lang.prompt": {
+        "en": "🌐 Choose your preferred language:",
+        "hi": "🌐 अपनी पसंदीदा भाषा चुनें:",
+    },
+    "lang.saved": {
+        "en": "✅ Language set. Restarting your menu in your language...",
+        "hi": "✅ भाषा सेट हो गई। मेनू आपकी भाषा में दिखेगा...",
+    },
+    "nav.home_connected": {
+        "en": "🏠 ChannelFlow AI\n\nWelcome back, {name}!\n\n🔗 Account: Connected\n\nChoose what you'd like to do:",
+        "hi": "🏠 ChannelFlow AI\n\nवापसी पर स्वागत है, {name}!\n\n🔗 अकाउंट: कनेक्टेड\n\nआप क्या करना चाहेंगे:",
+    },
+    "nav.home_unconnected": {
+        "en": "🏠 ChannelFlow AI\n\nHi {name}!\n\n🔗 Account: Not connected\n\nConnect your Telegram account to start automating forwards.",
+        "hi": "🏠 ChannelFlow AI\n\nनमस्ते {name}!\n\n🔗 अकाउंट: कनेक्ट नहीं है\n\nफ़ॉर्वर्डिंग शुरू करने के लिए अपना Telegram अकाउंट कनेक्ट करें।",
+    },
+    "nav.why_connect": {
+        "en": "🔐 Why connect your Telegram account?\n\nChannelFlow forwards using YOUR account, so:\n\n• You choose which channels/groups are watched\n• Content is forwarded the way you would send it\n• Your session is encrypted and never shared\n• Disconnect any time to stop everything\n\nYour login code is private - ChannelFlow support will never ask for it.",
+        "hi": "🔐 अपना Telegram अकाउंट क्यों कनेक्ट करें?\n\nChannelFlow आपके अकाउंट से फ़ॉर्वर्ड करता है, इसलिए:\n\n• आप तय करते हैं कौन से चैनल/ग्रुप देखे जाएँ\n• कंटेंट आपके भेजने के तरीके से जाता है\n• आपका सेशन एन्क्रिप्टेड है, किसी से शेयर नहीं होता\n• कभी भी डिस्कनेक्ट करके सब रोक सकते हैं\n\nआपका लॉगिन कोड निजी है - ChannelFlow सपोर्ट उसे कभी नहीं माँगेगा।",
+    },
+    "nav.your_tasks": {
+        "en": "📁 Your Tasks\n\nTap a task to open it, or create a new one:",
+        "hi": "📁 आपके टास्क\n\nकोई टास्क खोलने के लिए उसे दबाएँ, या नया बनाएँ:",
+    },
+    "nav.tasks_empty": {
+        "en": "📁 Your Tasks\n\nYou haven't created any tasks yet.\n\nCreate your first forwarding task to get started.",
+        "hi": "📁 आपके टास्क\n\nआपने अभी कोई टास्क नहीं बनाया है।\n\nशुरू करने के लिए अपना पहला फ़ॉर्वर्डिंग टास्क बनाएँ।",
+    },
+    "task.details": {
+        "en": "📌 {name}\n\nStatus: {status}\nRoute: {route}\n\nSources: {sources}\nDestinations: {destinations}",
+        "hi": "📌 {name}\n\nस्थिति: {status}\nरूट: {route}\n\nसोर्स: {sources}\nडेस्टिनेशन: {destinations}",
+    },
+    "task.deleted": {
+        "en": "🗑 Task deleted: {name}",
+        "hi": "🗑 टास्क डिलीट हुआ: {name}",
+    },
+    "task.delete_confirm": {
+        "en": "⚠️ Delete Task?\n\nTask: {name}\n\nThis action cannot be undone.",
+        "hi": "⚠️ टास्क डिलीट करें?\n\nटास्क: {name}\n\nयह क्रिया वापस नहीं हो सकती।",
+    },
+    "task.created": {
+        "en": "✅ Task created: {name}\n\nNow add a source and a destination to start it.",
+        "hi": "✅ टास्क बन गया: {name}\n\nइसे शुरू करने के लिए अब सोर्स और डेस्टिनेशन जोड़ें।",
+    },
+    "task.started": {
+        "en": "🟢 Task started: {name}",
+        "hi": "🟢 टास्क शुरू हुआ: {name}",
+    },
+    "task.stopped": {
+        "en": "🔴 Task stopped: {name}",
+        "hi": "🔴 टास्क रुक गया: {name}",
+    },
+    "nav.screen_expired": {
+        "en": "This screen has expired. Please open the section again.",
+        "hi": "यह स्क्रीन समाप्त हो गई है। कृपया सेक्शन फिर से खोलें।",
+    },
+    "nav.back": {"en": "◀️ Back", "hi": "◀️ पीछे"},
+    "nav.home": {"en": "🏠 Home", "hi": "🏠 होम"},
+    "support.why_connect_hint": {
+        "en": "🆘 Support\n\nChoose an option below:",
+        "hi": "🆘 सपोर्ट\n\nनीचे कोई विकल्प चुनें:",
+    },
 }
 
 _user_lang_cache = {}
@@ -212,7 +275,10 @@ def set_user_language(user_id, lang):
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET language=? WHERE telegram_id=?", (lang, user_id))
+    cur.execute(
+        "UPDATE users SET language=?, language_chosen=1 WHERE telegram_id=?",
+        (lang, user_id),
+    )
     conn.commit()
     conn.close()
 

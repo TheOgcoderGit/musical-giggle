@@ -65,6 +65,10 @@ WAITING_PAYMENT_SCREENSHOT = {}
 # user_id -> True while writing a feature request / feedback message
 WAITING_FEEDBACK = {}
 
+# user_id -> True while chatting with the Support AI assistant
+# (next plain text goes to support_ai_service)
+WAITING_SUPPORT_AI = {}
+
 # user_id -> True while typing a custom AI prompt (send '-' to clear)
 WAITING_AI_PROMPT = {}
 
@@ -120,3 +124,4 @@ CURRENT_DESTINATION = {}
 
 # Temporary user data
 USER_CACHE = {}
+

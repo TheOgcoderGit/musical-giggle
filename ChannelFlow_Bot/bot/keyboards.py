@@ -24,27 +24,55 @@ from telegram import (
 import json
 
 # ==========================================
-# MAIN MENU (reply keyboard) - minimal
-# Prompt 4 final requirement: exactly 4 primary actions
+# PERSISTENT REPLY-MENU LABELS (single source of truth)
+# UX-NAV-01/02: primary navigation lives on persistent reply
+# keyboards. Labels are deliberately language-stable (emoji + product
+# noun) so a stale keyboard from another language/state never breaks
+# matching; surrounding copy is localized through services.i18n_service.
+# handlers.py imports these constants - never hardcode a copy there.
 # ==========================================
 
-main_menu = ReplyKeyboardMarkup(
+MB_CONNECT_ACCOUNT = "🔗 Connect Account"
+MB_WHY_CONNECT = "❓ Why Connect?"
+MB_SUBSCRIPTION_PLAN = "💎 Subscription"
+MB_HOW_IT_WORKS = "📖 How It Works"
+MB_SUPPORT = "🆘 Support"
+
+MB_PROJECTS = "📁 Projects"
+MB_SUBSCRIPTION = "💳 Subscription"
+MB_REWARDS = "🎁 Rewards"
+MB_ACCOUNT = "👤 Account"
+MB_SETTINGS = "⚙️ Settings"
+MB_HOME = "🏠 Home"
+
+
+# ==========================================
+# MAIN MENU (reply keyboard)
+# ==========================================
+
+# Unconnected Main Menu (UX-NAV-01 92.2): primary actions only, no
+# advanced project controls that cannot work before account connection.
+pre_login_menu = ReplyKeyboardMarkup(
     [
-        ["➕ New Project", "🏠 Home"],
-        ["📁 My Projects", "⚙️ Settings"],
+        [MB_CONNECT_ACCOUNT, MB_WHY_CONNECT],
+        [MB_SUBSCRIPTION_PLAN, MB_HOW_IT_WORKS],
+        [MB_SUPPORT],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-
-pre_login_menu = ReplyKeyboardMarkup(
+# Connected Main Menu (UX-NAV-01 92.3): the authenticated experience.
+# If the account becomes disconnected every flow re-attaches
+# pre_login_menu, so no connected-only buttons remain visible.
+main_menu = ReplyKeyboardMarkup(
     [
-        ["🚀 Connect Now"],
-        ["📖 Guide", "🧭 Tour"]
+        [MB_PROJECTS, MB_SUBSCRIPTION],
+        [MB_REWARDS, MB_ACCOUNT],
+        [MB_SUPPORT, MB_SETTINGS],
     ],
     resize_keyboard=True,
-    is_persistent=True
+    is_persistent=True,
 )
 
 
@@ -75,52 +103,68 @@ def projects_section_keyboard(projects, can_create=True):
     return InlineKeyboardMarkup(rows)
 
 
+def _resolve_running(project_id, running):
+    """Legacy keyboards used to pass running=None and showed BOTH
+    Start and Pause (one of them dead). Resolve the real status when
+    the caller did not provide it so every rendered button is live."""
+    if running is not None:
+        return running
+    try:
+        from services.project_service import get_project
+        project = get_project(project_id)
+        if project is None:
+            return None
+        return bool(project["status"] if "status" in project.keys() else None)
+    except Exception:
+        return None
+
+
 def project_actions_keyboard(project_id, running=None, platform_type=None):
-    """Compact per-project view (Prompt 3 section 5): edit/status/
-    start-pause/delete + back. Contextual start/pause via ``running``."""
+    """Task-Details dashboard (UX-NAV-02 93.2): contextual actions
+    only. Every callback_data here is handled by button_handler; there
+    are no dead buttons. ``running`` resolves from the DB when the
+    caller does not pass it (legacy call sites)."""
 
-    if running is True:
-        toggle_row = [InlineKeyboardButton("⏸ Pause", callback_data=f"stop:{project_id}")]
-    elif running is False:
-        toggle_row = [InlineKeyboardButton("▶️ Start", callback_data=f"start:{project_id}")]
-    else:
-        toggle_row = [
-            InlineKeyboardButton("▶️ Start", callback_data=f"start:{project_id}"),
-            InlineKeyboardButton("⏸ Pause", callback_data=f"stop:{project_id}"),
-        ]
+    running = _resolve_running(project_id, running)
 
-    instagram_row = (
-        [InlineKeyboardButton("📸 Instagram", callback_data=f"instagram:{project_id}")]
-        if platform_type in ("instagram_broadcast", "both")
-        else None
+    toggle_row = (
+        [InlineKeyboardButton("⏸ Pause", callback_data=f"stop:{project_id}")]
+        if running is True
+        else [InlineKeyboardButton("▶️ Start", callback_data=f"start:{project_id}")]
     )
 
     rows = [
-        [
-            InlineKeyboardButton("⚙️ Edit Project", callback_data=f"editproj:{project_id}"),
-            InlineKeyboardButton("📊 Status", callback_data=f"stats:{project_id}"),
-        ],
         toggle_row,
         [
-            InlineKeyboardButton("📋 Clone", callback_data=f"cloneproj:{project_id}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"deleteconfirm:{project_id}"),
+            InlineKeyboardButton("📥 Sources", callback_data=f"listsource:{project_id}"),
+            InlineKeyboardButton("📤 Destinations", callback_data=f"listdestination:{project_id}"),
         ],
+        [
+            InlineKeyboardButton("🔎 Filters", callback_data=f"projfilters:{project_id}"),
+            InlineKeyboardButton("🧪 Test", callback_data=f"testproject:{project_id}"),
+        ],
+        [
+            InlineKeyboardButton("📊 Stats", callback_data=f"stats:{project_id}"),
+            InlineKeyboardButton("⚙️ Edit Task", callback_data=f"editproj:{project_id}"),
+        ],
+        [InlineKeyboardButton("🗑 Delete", callback_data=f"deleteconfirm:{project_id}")],
     ]
 
-    if instagram_row:
-        rows.append(instagram_row)
+    if platform_type in ("instagram_broadcast", "both"):
+        rows.append([InlineKeyboardButton("📸 Instagram", callback_data=f"instagram:{project_id}")])
 
     rows.append([
         InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
-        InlineKeyboardButton("⬅ Back to Projects", callback_data="nav:projects"),
+        InlineKeyboardButton("⬅ Tasks", callback_data="nav:projects"),
     ])
 
     return InlineKeyboardMarkup(rows)
 
 
 def edit_project_keyboard(project_id, platform_type=None):
-    """Categorized project management (Prompt 3 section 6). Each row is
-    its own submenu; nothing else leaks onto this screen."""
+    """⚙️ Edit Task root (UX-NAV-02 93.2): the task's configuration
+    grouped by area. ONLY areas with a live handler are listed - no
+    dead buttons (UX-NAV-01 92.5). Back returns to Task Details."""
 
     rows = [
         [
@@ -132,33 +176,23 @@ def edit_project_keyboard(project_id, platform_type=None):
             InlineKeyboardButton("🔁 Forwarding Rules", callback_data=f"projsettings:{project_id}"),
         ],
         [
-            InlineKeyboardButton("🤖 AI & Rewriting", callback_data=f"aisettings:{project_id}"),
-            InlineKeyboardButton("🛍 Affiliate Links", callback_data=f"affiliatesettings:{project_id}"),
-            InlineKeyboardButton("🖼 Watermark", callback_data=f"wmsettings:{project_id}"),
-        ],
-        [
-            InlineKeyboardButton("📝 Formatting", callback_data=f"fmtroot:{project_id}"),
+            InlineKeyboardButton("📝 Formatting", callback_data=f"formatting:{project_id}"),
             InlineKeyboardButton("⏱ Delay", callback_data=f"setdelay:{project_id}"),
         ],
         [
-            InlineKeyboardButton("📋 Clone", callback_data=f"cloneproj:{project_id}"),
-            InlineKeyboardButton("📊 Analytics", callback_data=f"analytics:{project_id}"),
+            InlineKeyboardButton("✏ Rename", callback_data=f"rename:{project_id}"),
+            InlineKeyboardButton("🧪 Test", callback_data=f"testproject:{project_id}"),
         ],
+        [InlineKeyboardButton("🗑 Delete Task", callback_data=f"deleteconfirm:{project_id}")],
     ]
 
     if platform_type in ("instagram_broadcast", "both"):
         rows.append([InlineKeyboardButton("📸 Instagram Pipeline", callback_data=f"instagram:{project_id}")])
 
-    rows += [
-        [
-            InlineKeyboardButton("✏ Rename", callback_data=f"rename:{project_id}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"deleteconfirm:{project_id}"),
-        ],
-        [
-            InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
-            InlineKeyboardButton("⬅ Back to Project", callback_data=f"projcard:{project_id}"),
-        ],
-    ]
+    rows.append([
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),
+    ])
 
     return InlineKeyboardMarkup(rows)
 
@@ -583,7 +617,9 @@ def formatting_remove_list_keyboard(project_id, patterns):
 # ==========================================
 
 def account_section_keyboard(connected=True):
-    """👤 Account hub (Prompt 3 section 37). Only features that exist."""
+    """👤 Account hub (UX-NAV-01 92.3). Every action is handled by
+    button_handler (acct:plan / acct:wallet / acct:earn /
+    acct:connections) - no dead buttons."""
 
     rows = [
         [InlineKeyboardButton("💳 Plan & Billing", callback_data="acct:plan")],
@@ -594,7 +630,7 @@ def account_section_keyboard(connected=True):
     if connected:
         rows.append([InlineKeyboardButton("🔗 Connected Accounts", callback_data="acct:connections")])
 
-    rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="nav:home")])
+    rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
 
     return InlineKeyboardMarkup(rows)
 
@@ -711,17 +747,17 @@ def referral_keyboard(bot_username, stats):
 # ==========================================
 
 def settings_section_keyboard(auto_renew_enabled=False):
-    """⚙️ Settings hub (Prompt 3 section 17/49)."""
+    """⚙️ Settings hub (canonical; UX-NAV-01 92.4). Only rows with a
+    live handler: Language, Auto-Renew, Wallet, Connected Accounts,
+    System Status, Support, Home."""
 
     renew_label = "🔁 Auto-Renew: ON" if auto_renew_enabled else "🔁 Auto-Renew: OFF"
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Account", callback_data="nav:account")],
-        [InlineKeyboardButton("💳 Plan & Billing", callback_data="acct:plan")],
-        [InlineKeyboardButton("🔗 Connected Accounts", callback_data="acct:connections")],
         [InlineKeyboardButton("🌐 Language", callback_data="settings:language")],
         [InlineKeyboardButton(renew_label, callback_data="settings:togglerenew")],
-        [InlineKeyboardButton("🔔 Notifications", callback_data="settings:notifications")],
+        [InlineKeyboardButton("💰 Wallet", callback_data="settings:wallet")],
+        [InlineKeyboardButton("🔗 Connected Accounts", callback_data="acct:connections")],
         [InlineKeyboardButton("📊 System Status", callback_data="settings:systatus")],
         [InlineKeyboardButton("🛟 Support", callback_data="nav:help")],
         [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
@@ -820,6 +856,20 @@ def support_ticket_keyboard(ticket_id, status):
     return InlineKeyboardMarkup(rows)
 
 
+# ---------------------------------------------------------------------------
+# UNREFERENCED LEGACY / REFERENCE-BOT KEYBOARD SECTIONS
+# ---------------------------------------------------------------------------
+# Everything below until the ADMIN KEYBOARD section was carried over
+# from the reference "Prompt 3" bot. NO live handler imports or renders
+# these builders (audited UX-NAV-02); they emit callbacks that have no
+# handler (pay:*, pacct:*, wacode:*, wallet:redeem, settings:notifications,
+# ...) and must therefore NEVER be attached to a rendered message. In
+# particular, the ⭐ Telegram Stars rows here are gated OFF: Stars
+# checkout/precheckout is not implemented, so rendering these buttons
+# would violate UX-NAV-01 92.5 ("never dead buttons"). Live payment UI
+# is the upgrade:* chain in bot/handlers.py.
+# ---------------------------------------------------------------------------
+
 # ==========================================
 # PAYMENT FLOW (method-first)
 # ==========================================
@@ -833,7 +883,9 @@ def payment_method_keyboard(crypto_available=True, upi_available=True):
         rows.append([InlineKeyboardButton("🇮🇳 UPI", callback_data="pay:plans:upi")])
     if crypto_available:
         rows.append([InlineKeyboardButton("₿ Crypto", callback_data="pay:plans:crypto")])
-    rows.append([InlineKeyboardButton("⭐ Telegram Stars", callback_data="pay:plans:stars")])
+    # ⭐ Telegram Stars intentionally NOT offered: checkout/precheckout
+    # handlers do not exist yet, so a Stars button would be dead
+    # (UX-NAV-01 92.5 companion defect).
 
     if not rows:
         rows.append([InlineKeyboardButton("⚠ No payment methods configured", callback_data="noop")])
@@ -1010,12 +1062,10 @@ def instagram_management_keyboard(project_id, has_processing_channel, destinatio
         InlineKeyboardButton("📋 Review Approval Queue", callback_data=f"igqueue:{project_id}:0")
     ])
 
+    # NOTE: no "Caption Formatting" row - no live handler exists for it
+    # and UX-NAV-01 92.5 forbids dead buttons.
     buttons.append([
-        InlineKeyboardButton("🎨 Caption Formatting", callback_data=f"igformat:{project_id}")
-    ])
-
-    buttons.append([
-        InlineKeyboardButton("⬅ Back to Project", callback_data=f"projcard:{project_id}")
+        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}")
     ])
 
     return InlineKeyboardMarkup(buttons)
@@ -1059,4 +1109,70 @@ def account_card_keyboard(connected: bool):
 def project_keyboard(project_id, running=None, platform_type=None):
     """Legacy alias - delegates to project_actions_keyboard for backwards
     compatibility with existing handlers that still import this name."""
+    return project_actions_keyboard(project_id, running=running, platform_type=platform_type)
+
+
+# ==========================================
+# UX-NAV-01: ACCOUNT-STATE PERSISTENT MENUS
+# ==========================================
+# Primary navigation lives on persistent reply keyboards; inner
+# sections use contextual inline keyboards (UX-NAV-01 section 6).
+# Button labels are deliberately language-stable (emoji + product
+# noun) so a stale keyboard from a previous language never breaks
+# matching; surrounding copy is localized through i18n_service.
+
+def menu_unconnected_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [MB_CONNECT_ACCOUNT, MB_WHY_CONNECT],
+            [MB_SUBSCRIPTION_PLAN, MB_HOW_IT_WORKS],
+            [MB_SUPPORT],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def menu_connected_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [MB_PROJECTS, MB_SUBSCRIPTION],
+            [MB_REWARDS, MB_ACCOUNT],
+            [MB_SUPPORT, MB_SETTINGS],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# First-run language picker (UX-NAV-01): English + Hinglish. The full
+# 7-language picker stays available under Settings -> Language.
+FIRST_RUN_LANGUAGE_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")],
+    [InlineKeyboardButton("🇮🇳 हिंदी (Hinglish)", callback_data="lang:hi")],
+])
+
+
+# ==========================================
+# UX-NAV-02: TASK LIST / TASK DETAILS
+# ==========================================
+
+def task_list_keyboard(projects, can_create=True):
+    """📁 Projects = task list FIRST. One row per task; selecting a
+    task opens its Task Details card. No advanced actions on this
+    screen - only what a list needs."""
+    rows = []
+    for i, p in enumerate(projects, start=1):
+        icon = "🟢" if p["status"] else "⚪"
+        label = f"{i}. {icon} {p['name'][:30]}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"projcard:{p['id']}")])
+    if can_create:
+        rows.append([InlineKeyboardButton("➕ New Task", callback_data="newproj")])
+    rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def task_detail_keyboard(project_id, running=None, platform_type=None):
+    """Task Details card (UX-NAV-02 93.2). Canonical implementation is
+    project_actions_keyboard; this is a same-content alias."""
     return project_actions_keyboard(project_id, running=running, platform_type=platform_type)

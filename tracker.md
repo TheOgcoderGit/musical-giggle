@@ -7,10 +7,10 @@
   - Upstream `main` contains only: `ChannelFlow_AI_Master_PRD.md`, `ChannelFlow_Bot.zip` (base, 299,994 bytes), `README.md`
 - Base ZIP: `ChannelFlow_Bot.zip` in repo root (the 2026-09-05 upload; the only base provided — no FIXED_v4 or older duplicate was used)
 - PRD: `ChannelFlow_AI_Master_PRD.md` (3452 lines, now extended to §94 with UX-NAV-01/02/03–06)
-- Current implementation batch: **Batch 1** (in progress → completed by this checkpoint)
-- Last completed batch: (none — first batch on this tracker)
-- Last tested batch: Batch 1 (tests executed below; results in Batch History)
-- Next starting point: **Batch 2, Feature 1 = UX-NAV-01 (Unified Onboarding & Navigation UX)** — see Resume Point
+- Current implementation batch: **Batch 2** (in progress → completed by this checkpoint)
+- Last completed batch: Batch 1 (see Batch History) and **Batch 2 = UX-NAV-01 + UX-NAV-02** (this checkpoint)
+- Last tested batch: Batch 2 (tests executed below; results in Batch History)
+- Next starting point: next batch after product owner go-ahead (Batch-3 candidates in Resume Point) — see Resume Point
 
 ## Status Legend
 
@@ -126,13 +126,57 @@
 | PRD §75–77 | callback/command integrity, no dead UI | PARTIAL | bot/keyboards.py vs handlers | audit script | matrix shows likely orphans (nav:/pay:/pacct:/wacode:/aisettings:/cloneproj:/editproj:/deleteconfirm:/projcard:/aff*/wm*/ai*/lang:/analytics:) |
 | PRD §78 | legacy consolidation | PARTIAL | ChannelFlowAI5_monetization/ | — | stale duplicate tree in source |
 | PRD §79 | docs match reality | PARTIAL | README.md (repo) | — | full rewrite TODO (Batch final) |
-| UX-NAV-01 (§92) | Unified Onboarding & Navigation UX | TODO | — | — | Batch 2 Feature 1 (PRD updated, tracker row added) |
-| UX-NAV-02 (§93) | Task-first navigation & message lifecycle | TODO | — | — | Batch 2 Feature 2 (PRD updated, tracker row added) |
-| UX-NAV-03..06 (§94) | Discovered UX backlog | TODO | — | — | doc-only backlog, prioritize later |
+| UX-NAV-01 (§92) | Unified Onboarding & Navigation UX | Y (users.language_chosen) | Y (i18n_service keys/flag) | Y (handlers/menu) | Y (reply menus + hub screens) | Pending live-Telegram | Y (unit/sim: 24 new) | VERIFIED (mock/simulation) |
+| UX-NAV-02 (§93) | Task-first navigation & message lifecycle | — | Y (nav_state module) | Y (nav:/projcard:/editproj:/deleteconfirm:/… routes) | Y (task list/detail/edit/confirm) | Pending live-Telegram | Y (unit/sim) | VERIFIED (mock/simulation) |
+| UX-NAV-03..06 (§94) | Discovered UX backlog | TODO | — | — | doc-only backlog, prioritize later (explicitly NOT implemented out of order) |
 
 \* VERIFIED = verified at the level possible without live Telegram credentials (unit/integration/DB/runtime repro). Live-account E2E remains the documented limitation.
 
 ## Batch History
+
+### Batch 2 — UX-NAV-01 Unified Onboarding & Navigation UX + UX-NAV-02 Task-First Navigation & Message Lifecycle (2026-09-07)
+
+Tracked as ONE feature batch per the product-owner UX requirement (PRD §92/§93, appended verbatim in Batch 1; §94 backlog documented but NOT implemented out of order).
+
+Features implemented:
+1. **Language-first /start (92.1/92.7)**: `users.language_chosen` column (default 0; guarded ALTER for existing DBs); first `/start` shows the en/hi picker (`FIRST_RUN_LANGUAGE_KEYBOARD`, callback `lang:*`), selection persists via `i18n.set_user_language` (+flag); repeated `/start` never re-asks, never duplicates users/trials/sessions; picker is bypassed for users who already chose.
+2. **Account-state persistent menus (92.2/92.3)**: unconnected menu (Connect Account / Why Connect / Subscription / How It Works / Support) vs connected menu (Projects / Subscription / Rewards / Account / Support / Settings); every label is matched by `menu_handler` (labels shared from keyboards.py constants - no more dead "🏠 Home"/"⚙️ Settings" reply rows that fell through to the fallback). All legacy reply sites route through state-aware `_reply_menu_for`; disconnect re-attaches the unconnected menu and clears connected screens (92.3 auto-return).
+3. **Back/Home everywhere + centralized navigation state (92.4–92.6 / 93.4)**: new `bot/nav_state.py` - per-user screen stack (never global), `place()` message-lifecycle choke point, pure helpers (`home_variant`, `expired_for`, ...) unit-tested. `nav:*` (home/projects/account/settings/help), `lang:*`, `newproj`, `projcard`, `editproj`, `deleteconfirm`, `deletesourceconfirm`, `deletedestinationconfirm`, `filterkw/filterdomains/filtersenders`, `clearfiltersconfirm`, `fmtroot`, `support:*`, `help:*` handlers implemented; stale callbacks answer "screen expired → Home".
+4. **Task-first hub (93.1/93.2)**: 📁 Projects = task LIST first (one row per task) with empty state ("Create Your First Task"); Task Details card compact (status/route/sources/destinations + Start-Pause + Sources/Destinations/Filters/Test/Stats/Edit/Delete + Home/Tasks); delete always confirms then refreshes the list (empty state on last delete); start/stop/stats/logs edit the dashboard message in place instead of stacking duplicates.
+5. **Message lifecycle (93.3)**: interactive hub screens edit in place when triggered from an inline button; fresh renders delete the previously tracked BOT message (never user messages - deletion only ever targets bot-sent screens recorded in the per-user stack, and only via `Chat.delete_message` on ids we stored); on edit errors fall back delete-and-resend; OTP/2FA category-C cleanup untouched (never logs values).
+6. **Support hub + tickets usable pre-login (92.2 companion)**: Support AI chat (`support:ai`), Support Team/FAQ/Guide/Tour, My Tickets list/view/reply/close/reopen with ownership checks, New Ticket (category → subject → body), Feature Request (`help:feedback`) stored as a `feature` ticket for ANY user incl. never-connected anonymous users (companion-defect fix - no more crash/strand on unconnected feature requests).
+7. **Companion defects carried in this batch**:
+   - Orphan-callback UI-integrity: every callback statically produced by DISPLAYED keyboards now has a handler (audit test `test_no_dead_buttons_on_displayed_keyboards`); dead rows removed/rewritten (Settings hub, Account hub, project dashboards, filter/formatting sub-screens, Instagram "Caption Formatting" row removed); admin:payments sub-screen implemented (was "⚠ Unknown Admin Action").
+   - Stars gate: no displayed keyboard renders Stars/pay:* buttons (payment UX uses the live upgrade:* chain; plan/billing screens explain Stars is "not available yet" as text). Real invoice/precheckout flow remains a documented future batch.
+   - `main_menu`/`pre_login_menu` reply keyboards realigned to the account-state menus (base had label mismatches: "🏠 Home" and "⚙️ Settings" reply rows were NOT handled by menu_handler and dead-ended in the fallback).
+
+Bugs fixed in Batch 2: dead "🏠 Home"/"⚙️ Settings" reply rows; orphan callbacks on every displayed project/settings/account/support keyboard (nav:, projcard:, newproj, editproj:, deleteconfirm:, filterkw:, fmtroot:, deletesourceconfirm:, etc.); settings hub with 7/9 dead rows; account hub dead rows; admin:payments dead row; anonymous feature-request gap; sqlite Row `.get()` crashes in new task-detail paths; `project_actions_keyboard` showed Start AND Pause when running state was not passed (one was always dead → resolves status from DB).
+
+Files changed:
+- database/db.py (users.language_chosen + guarded migration)
+- bot/keyboards.py (MB_* label constants; account-state reply menus; rewritten displayed keyboards: project actions/task detail, edit root, account hub, settings hub; Stars row gated in reference payment keyboards; banner marking UNREFERENCED legacy sections)
+- bot/states.py (WAITING_SUPPORT_AI / WAITING_TICKET_SUBJECT/MESSAGE/REPLY)
+- services/i18n_service.py (UX-NAV keys EN+HI: lang.*, nav.home_connected/home_unconnected, nav.why_connect, nav.your_tasks/tasks_empty, task.details/deleted/delete_confirm/created/started/stopped, nav.screen_expired, nav.back/home, support.why_connect_hint; `set_user_language` sets language_chosen=1)
+- bot/nav_state.py (NEW - per-user nav stack + place() lifecycle + pure helpers)
+- bot/handlers.py (/start language-first + home routing; menu_handler account-state routing + support/ticket/feedback waits; ~20 new callback actions incl. nav/lang/newproj/projcard/editproj/deleteconfirm/deletesourceconfirm/deletedestinationconfirm/filter*/clearfiltersconfirm/fmtroot/support:*/help:*/acct:plan|wallet|connections/admin:payments; settings:language/systatus/disconnect re-state; start/stop/stats/logs/delete edit-in-place; `_reply_menu_for` sweep)
+- tests/test_uxnav_batch2.py (NEW - 24 tests)
+
+Tests executed (Batch 2):
+- pytest suite: 48 passed (24 Batch-1 + 24 Batch-2 new)
+- legacy standalone regressions: test_db_migration.py / test_final_fix.py / test_db.py ALL PASS
+- compileall across bot/services/database/core/destinations/tests/main.py: PASS
+- simulation smoke (fake updates/messages): unconnected + connected menu routing, task list→detail→edit→list chain, plan/account/settings/support hubs, nav:home inline edit, settings:disconnect → unconnected state, post-disconnect gate: PASS
+- UI-integrity callback audit (test): PASS - no orphan prefixes on displayed keyboards, no pay:/Stars rows
+
+Test result: PASS (live-Telegram E2E still BLOCKED - no real credentials in sandbox)
+
+Remaining issues after Batch 2: live Telegram E2E BLOCKED (sandbox has no real API creds); Stars checkout/precheckout (invoice flow) still not implemented - UI fully gated, backend work deferred; several inner screens (plan/rewards/settings hub bodies, deep filter/formatting prompts) still English hard-coded - EN/HI i18n rollout for all copy is a future pass (existing legacy languages preserved for existing keys); unreferenced reference-bot keyboard sections in keyboards.py still carry orphan payloads (never rendered - cleanup candidate, bug (e) family); WhatsApp CDN placeholder URLs (bug c), whatsapp_pairing seed sample codes (bug d), core.client import side-effect ChannelFlow.session (bug f).
+
+Commit/version identifier: see git log (Batch 2 commit after this tracker update).
+
+ZIP generated: `ChannelFlowAI_Batch02_CHECKPOINT.zip` (repo root; excludes secrets/DBs/caches)
+
+Next batch: candidates = UX-NAV-03..06 backlog (pagination, plan-locked CTA states, loading/error-state consistency, onboarding chips) when the product owner schedules them, plus remaining open bugs (c/d/e/f), Stars real checkout, full-HI copy pass.
 
 ### Batch 1 — Core Identity & Forwarding Integrity (2026-09-07)
 
@@ -186,28 +230,37 @@ Next batch: Batch 2 = UX-NAV-01 (Unified Onboarding & Navigation UX) + UX-NAV-02
 ## Resume Point
 
 ```
-CURRENT BATCH:              Batch 1 — COMPLETE (checkpoint ZIP created; awaiting user go-ahead)
-LAST COMPLETED FEATURE:     #5 Forwarding-engine quota/integrity fix (Batch 1)
-LAST VERIFIED FEATURE:      #5 (runtime repro PASS); #1–4 verified at unit/integration/DB level
-NEXT FEATURE:               Batch 2 Feature 1 = UX-NAV-01 Unified Onboarding & Navigation UX
-KNOWN BUGS:                 [open] (b) orphan callbacks nav:/pay:/pacct:/wacode:/ai*/aff*/wm*/lang:/
-                            analytics:/editproj:/projcard:/cloneproj:/deleteconfirm: have no handlers in
-                            button_handler → UX-NAV batch; (c) media publish for WhatsApp uses placeholder
-                            CDN URLs (provider work); (d) whatsapp_pairing seed block inserts sample codes
-                            for first user at DB init (cleanup candidate); (e) ChannelFlowAI5_monetization/
-                            duplicate handler tree (legacy consolidation); (f) core/forwarder.py imports
-                            core.client at module import → TelegramClient(SESSION_NAME,...) construction
-                            side-effect creates an empty ChannelFlow.session file on any import (gitignored;
-                            lazy-construction cleanup candidate)
-                            [fixed in Batch 1] (a) stars_monthly_price column gap in plan_configs crashed
-                            get_entitlements on fresh/existing DBs → column added to CREATE + late migration
-                            + seeds (FREE 0 / BEGINNER 99 / PRO 249 / CREATOR 499)
+CURRENT BATCH:              Batch 2 — COMPLETE (UX-NAV-01 + UX-NAV-02; checkpoint ZIP + commit pushed;
+                            awaiting user go-ahead for the next batch)
+LAST COMPLETED FEATURE:     UX-NAV-02 task-first navigation + message lifecycle (Batch 2, single batch
+                            covering the whole product-owner UX requirement)
+LAST VERIFIED FEATURE:      UX-NAV-01/02 verified at unit + simulation + DB level (48 pytest tests PASS;
+                            legacy test_db/test_db_migration/test_final_fix PASS)
+NEXT FEATURE:               TBD by product owner — documented candidates: UX-NAV-03..06 backlog (§94),
+                            Stars real checkout/precheckout, WhatsApp CDN placeholder URLs,
+                            whatsapp_pairing seed cleanup, ChannelFlowAI5 duplicate tree consolidation,
+                            lazy core.client construction, full EN+HI copy pass
+KNOWN BUGS:                 [open] (c) media publish for WhatsApp uses placeholder CDN URLs (provider
+                            work); (d) whatsapp_pairing seed block inserts sample codes for first user at
+                            DB init (cleanup candidate); (e) keyboards.py unreferenced reference-bot
+                            keyboard sections (pay:/pacct:/wacode:/ai/aff/wm payloads, never rendered —
+                            banner-marked; consolidation candidate) + ChannelFlowAI5_monetization/
+                            duplicate handler tree; (f) core.client import side-effect creates empty
+                            ChannelFlow.session file on any import (gitignored; lazy-construction
+                            cleanup candidate); (g) Stars purchase backend (send_invoice/pre_checkout/
+                            successful_payment) not implemented — UI fully gated since Batch 2, no dead
+                            buttons (upgrade:* chain + explanatory copy)
+                            [fixed in Batch 2] (b) orphan callbacks on DISPLAYED keyboards (nav:/
+                            projcard:/newproj/editproj:/deleteconfirm:/filter*/fmtroot/support:*/help:*/
+                            acct:plan|wallet|connections/admin:payments/lang:* now handled; Settings hub
+                            7/9 dead rows fixed; dead reply rows 🏠 Home/⚙️ Settings fixed; Stars rows
+                            gated; audit test enforces no dead displayed callbacks)
+                            [fixed in Batch 1] (a) stars_monthly_price column gap in plan_configs
 KNOWN BLOCKERS:             live Telegram account test (no real API_ID/API_HASH/BOT_TOKEN in sandbox);
                             Meta WhatsApp Cloud API credentials; Oxapay key; OpenRouter key
-NEXT TESTS:                 Batch 2 test list: language select/persist, /start idempotency, unconnected
-                            + connected menus, Back/Home context, disconnect → unconnected menu,
-                            callback authorization, two-user isolation, EN + Hinglish, message-edit
-                            fallback, login cleanup, plus full callback/command integrity audit
+NEXT TESTS:                 Batch 3 test list: UX-NAV-03 pagination, plan-locked CTA states, Stars
+                            checkout handlers once a test bot is available, plus rerun of the 48-test
+                            suite + UI-integrity audit after every UI change
 ```
 
 ## Deployment & Test Notes

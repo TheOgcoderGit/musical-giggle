@@ -55,6 +55,33 @@ from bot.keyboards import (
     formatting_replace_list_keyboard,
     formatting_remove_list_keyboard,
     account_card_keyboard,
+    # UX-NAV-01/02 account-state menus + task hub (imported here so the
+    # full surface is import-auditable for the orphan-callback tests)
+    menu_unconnected_keyboard,
+    menu_connected_keyboard,
+    FIRST_RUN_LANGUAGE_KEYBOARD,
+    LANGUAGE_KEYBOARD,
+    task_list_keyboard,
+    task_detail_keyboard,
+    delete_confirm_keyboard,
+    edit_project_keyboard,
+    keyword_filter_keyboard,
+    domain_filter_keyboard,
+    sender_filter_keyboard,
+    support_section_keyboard,
+    support_ticket_keyboard,
+    # reply-menu label constants (single source of truth in keyboards.py)
+    MB_CONNECT_ACCOUNT,
+    MB_WHY_CONNECT,
+    MB_SUBSCRIPTION_PLAN,
+    MB_HOW_IT_WORKS,
+    MB_SUPPORT,
+    MB_PROJECTS,
+    MB_SUBSCRIPTION,
+    MB_REWARDS,
+    MB_ACCOUNT,
+    MB_SETTINGS,
+    MB_HOME,
 )
 
 from services import i18n
@@ -80,7 +107,12 @@ from bot.states import (
     WAITING_CONNECT_STAGE,
     WAITING_CONNECT_STAGE_STARTED,
     WAITING_PAYMENT_SCREENSHOT,
-    CURRENT_PROJECT
+    CURRENT_PROJECT,
+    WAITING_SUPPORT_AI,
+    WAITING_TICKET_SUBJECT,
+    WAITING_TICKET_MESSAGE,
+    WAITING_TICKET_REPLY,
+    WAITING_FEEDBACK,
 )
 
 from database.models import register_user, get_all_user_ids, count_users
@@ -126,6 +158,9 @@ from services.destination_service import (
 from services import settings_service, log_service, stats_service
 from services import instagram_service, processing_service
 from services.platform_registry import get_platform, get_platforms
+from services import support_service, support_ai_service, knowledge_service
+
+from bot import nav_state
 from destinations.instagram_destination import is_configured as is_ig_configured, verify_capability as verify_ig_capability
 
 from core.telegram_utils import get_chat, send_test_message
@@ -214,6 +249,18 @@ MAIN_MENU_BUTTONS = {
     BTN_MY_PLAN
 }
 
+# Connected-menu labels (UX-NAV-01 92.3) + the legacy labels they
+# replace. Pressing any of these clears pending input states so the
+# user can never get permanently stuck mid-flow.
+CONNECTED_MENU_LABELS = MAIN_MENU_BUTTONS | {
+    MB_PROJECTS,
+    MB_SUBSCRIPTION,
+    MB_REWARDS,
+    MB_ACCOUNT,
+    MB_SETTINGS,
+    MB_HOME,
+}
+
 MAX_NAME_LENGTH = 100
 
 PLATFORM_LABELS = {
@@ -254,11 +301,29 @@ def _reset_waiting_states(user_id):
     WAITING_FORMATTING_FIELD.pop(user_id, None)
     WAITING_REPLACE_RULE.pop(user_id, None)
     WAITING_REMOVE_PATTERN.pop(user_id, None)
+    # Support-hub text inputs (UX-NAV companion): leaving the hub or
+    # navigating away always clears them so a stale flag never swallows
+    # an unrelated future message.
+    WAITING_SUPPORT_AI.pop(user_id, None)
+    WAITING_TICKET_SUBJECT.pop(user_id, None)
+    WAITING_TICKET_MESSAGE.pop(user_id, None)
+    WAITING_TICKET_REPLY.pop(user_id, None)
+    WAITING_FEEDBACK.pop(user_id, None)
     cancel_promo(user_id)
 
     if WAITING_CONNECT_PHONE.pop(user_id, None) is not None or WAITING_CONNECT_STAGE.pop(user_id, None):
         WAITING_CONNECT_STAGE_STARTED.pop(user_id, None)
         user_sessions.cancel_connect(user_id)
+
+
+def _reply_menu_for(user_id):
+    """Persistent reply menu matching the CURRENT account state
+    (UX-NAV-01 92.3): connected users get the authenticated menu,
+    everyone else the unconnected menu. Used at every reply site so a
+    stale keyboard never stays on screen after a state change."""
+    if user_id in ADMIN_IDS or user_sessions.is_connected(user_id):
+        return menu_connected_keyboard()
+    return menu_unconnected_keyboard()
 
 
 # ==========================================
@@ -535,8 +600,8 @@ def _account_card_text(user, plan_entitlements, phone_number, active_task_count,
     )
 
 
-async def _send_account_card(message, user):
-
+async def _account_card_payload(user):
+    """Reads everything the account card needs in one place."""
     entitlements = plan_service.get_entitlements(user.id)
     referral_stats = referral_service.get_referral_stats(user.id)
 
@@ -564,51 +629,198 @@ async def _send_account_card(message, user):
         except (TypeError, ValueError):
             pass
 
-    await message.reply_text(
+    return (
         _account_card_text(user, entitlements, phone, active_count, days_remaining, referral_stats),
-        reply_markup=account_card_keyboard(connected=bool(phone))
+        account_card_keyboard(connected=bool(phone)),
+    )
+
+
+async def _show_account_hub(message, user, edit=False):
+    """👤 Account hub (UX-NAV-01 92.3). Live rows only: Plan & Billing,
+    Wallet, Referrals, Connected Accounts (when connected), Home."""
+    text, markup = await _account_card_payload(user)
+    return await nav_state.place(message, user.id, "account", text, reply_markup=markup, edit=edit)
+
+
+async def _send_account_card(message, user):
+    # Legacy entry point (fresh message render).
+    return await _show_account_hub(message, user, edit=False)
+
+
+# ==========================================
+# SUPPORT HUB TEXT INPUTS (UX-NAV companion)
+# ==========================================
+
+async def _handle_support_ai_message(message, user_id, text):
+    """Chat message while WAITING_SUPPORT_AI: forwarded to the Support
+    AI assistant. Keeps the flag so the conversation can continue until
+    the user navigates Home / leaves the hub."""
+    result = await support_ai_service.get_support_ai_response(
+        user_id, text, user_context=None
+    )
+    if result and result.success:
+        await message.reply_text(f"🤖 {result.text}", disable_web_page_preview=True)
+    else:
+        error = (result.error if result else "Service unavailable") or "Service unavailable"
+        await message.reply_text(f"⚠️ {error}")
+    return
+
+
+async def _handle_ticket_subject(message, user_id, text):
+    state = WAITING_TICKET_SUBJECT.get(user_id)
+    if not state:
+        return
+    subject = (text or "").strip()
+    if not subject:
+        await message.reply_text("❌ Subject cannot be empty. Send a short subject, or /cancel.")
+        return
+    if len(subject) > 200:
+        await message.reply_text(f"❌ Subject is too long (max 200 characters). Try again.")
+        return
+    WAITING_TICKET_SUBJECT.pop(user_id, None)
+    WAITING_TICKET_MESSAGE[user_id] = {"category": state["category"], "subject": subject}
+    await message.reply_text(
+        f"🎫 Subject: {subject}\n\n"
+        "Now describe your issue in a few lines (you can also send a "
+        "screenshot after finishing)."
+    )
+
+
+async def _handle_ticket_message(message, user_id, text):
+    state = WAITING_TICKET_MESSAGE.get(user_id)
+    if not state:
+        return
+    body = (text or "").strip()
+    if not body:
+        await message.reply_text("❌ Please describe the issue - a few words is enough.")
+        return
+    WAITING_TICKET_MESSAGE.pop(user_id, None)
+
+    ticket_id = support_service.create_ticket(
+        user_id, state["category"], state["subject"], body
+    )
+    await message.reply_text(
+        "✅ " + i18n.t(user_id, "support.ticket_created", id=ticket_id),
+        reply_markup=_ticket_back_markup(ticket_id),
+    )
+
+
+async def _handle_ticket_reply(message, user_id, text):
+    ticket_id = WAITING_TICKET_REPLY.get(user_id)
+    if ticket_id is None:
+        return
+    ticket = support_service.get_ticket(ticket_id)
+    if ticket is None or ticket["user_id"] != user_id:
+        WAITING_TICKET_REPLY.pop(user_id, None)
+        await message.reply_text("⚠ This ticket is no longer active.")
+        return
+    body = (text or "").strip()
+    if not body:
+        await message.reply_text("❌ Reply cannot be empty.")
+        return
+    WAITING_TICKET_REPLY.pop(user_id, None)
+    support_service.add_message(ticket_id, user_id, "user", body)
+    if ticket["status"] in ("resolved", "closed"):
+        support_service.set_status(ticket_id, "open")
+    await message.reply_text("✅ Reply added to ticket.", reply_markup=_ticket_back_markup(ticket_id))
+
+
+def _ticket_back_markup(ticket_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎫 View Ticket", callback_data=f"support:view:{ticket_id}"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ]])
+
+
+async def _handle_feedback_message(message, user_id, text):
+    """Feature-request text. Works for ANY user who reached the hub
+    (including accounts that never connected one) - the request is
+    stored as a 'feature' support ticket and never crashes on missing
+    account state (UX-NAV companion defect)."""
+    WAITING_FEEDBACK.pop(user_id, None)
+    body = (text or "").strip()
+    if not body:
+        await message.reply_text("❌ Please describe the feature you'd like.")
+        return
+    ticket_id = support_service.create_ticket(user_id, "feature", "Feature Request", body)
+    await message.reply_text(
+        "✅ Thanks! Your feature request was saved "
+        f"(#{ticket_id}). We read every request.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            InlineKeyboardButton("🆘 Support", callback_data="nav:help"),
+        ]]),
     )
 
 
 # ==========================================
-# /start
+# /start - UX-NAV-01 unified onboarding
 # ==========================================
+# Order of a /start run:
+#   1. register_user (idempotent upsert - never duplicates users)
+#   2. one-time trial grant (idempotent - never re-grants)
+#   3. referral capture from ?start=<code>
+#   4. maintenance gate
+#   5. language-first picker when users.language_chosen == 0
+#      (92.1) - only en/hi on first run; selection persists and the
+#      bot never asks again
+#   6. account-state-aware Home (92.2/92.3): connected -> connected
+#      menu, unconnected -> unconnected menu. Repeated /start is
+#      idempotent: it only ever re-shows the current appropriate state.
 
-def _welcome_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Connect", callback_data="acct:connect")]])
+def _language_chosen(user_id) -> bool:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT language_chosen FROM users WHERE telegram_id=?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+        return bool(row and row["language_chosen"])
+    except Exception:
+        return True  # never block on DB problems - show the menu
 
 
-async def _send_welcome(message, user, trial_active=False, trial_new=False):
-
-    trial_line = ""
+def _trial_note(trial_new, trial_active):
     if trial_new:
-        trial_line = (
+        return (
             "🎁 Your 7-day Creator trial is NOW ACTIVE - unlimited "
             "projects, sources and destinations while it lasts.\n\n"
         )
-    elif trial_active:
-        trial_line = (
-            "🎁 Your 7-day Creator trial is active.\n\n"
-        )
+    if trial_active:
+        return "🎁 Your 7-day Creator trial is active.\n\n"
+    return ""
 
-    await message.reply_text(
 
-        f"👋 Welcome, creator, to ChannelFlow AI!\n\n"
-        f"{trial_line}"
-        "This bot watches the Telegram channels and groups you choose "
-        "and automatically forwards or copies new posts into other "
-        "destinations for you - Telegram today, with WhatsApp and "
-        "Threads support on the way.\n\n"
-        "Set filters on what gets through, reformat or replace text "
-        "before it goes out, add delays, and let the bot handle "
-        "retries and reliability so you don't have to babysit it.\n\n"
-        "Everything runs on your own connected Telegram account - "
-        "nothing is shared with other users, and your login is "
-        "encrypted the moment it's saved.\n\n"
-        "Tap Connect below to get started.",
+def _home_text(user, is_connected, trial_new=False, trial_active=False):
+    name = (user.first_name or "").strip() or "creator"
+    note = _trial_note(trial_new, trial_active)
+    if is_connected:
+        header = i18n.t(user.id, "nav.home_connected", name=name)
+    else:
+        header = i18n.t(user.id, "nav.home_unconnected", name=name)
+    return f"{header}\n\n{note}".rstrip("\n")
 
-        reply_markup=_welcome_keyboard()
 
+async def _go_home(message, user, edit=False):
+    """Account-state-aware Home (UX-NAV-01 92.2/92.3). Always safe:
+    never cancels flows or touches configuration - it only re-renders
+    the appropriate Main Menu state."""
+    _reset_waiting_states(user.id)
+    connected = user.id in ADMIN_IDS or user_sessions.is_connected(user.id)
+    text = _home_text(user, connected)
+    menu = menu_connected_keyboard() if connected else menu_unconnected_keyboard()
+    if edit:
+        # An inline 🏠 Home on a bot message: refresh this message only;
+        # the persistent reply menu was already attached by the last
+        # fresh render / state change.
+        return await nav_state.place(message, user.id, "home", text, reply_markup=None, edit=True)
+    return await nav_state.place(message, user.id, "home", text, reply_markup=menu, edit=False)
+
+
+async def _send_language_picker(message, user_id):
+    return await message.reply_text(
+        i18n.t(user_id, "lang.prompt"),
+        reply_markup=FIRST_RUN_LANGUAGE_KEYBOARD,
     )
 
 
@@ -647,22 +859,14 @@ async def start(
 
         return
 
-    # Not connected (and not the admin, who's exempt - see the LOGIN
-    # GATE comment in menu_handler) -> welcome screen with a single
-    # Connect button, not the account card. This is also what a user
-    # sees again after /disconnect, since that's exactly what makes
-    # is_connected() False again - no separate "returning user" state
-    # to track.
-    if user.id not in ADMIN_IDS and not user_sessions.is_connected(user.id):
-        await _send_welcome(
-            update.message, user,
-            trial_active=not trial_new,
-            trial_new=trial_new,
-        )
+    # UX-NAV-01 92.1: language-first onboarding - a user without a
+    # saved language preference sees the picker ONCE. After choosing,
+    # lang:* continues straight into the appropriate Home below.
+    if not _language_chosen(user.id):
+        await _send_language_picker(update.message, user.id)
         return
 
-    await _send_account_card(update.message, user)
-    await update.message.reply_text(i18n.t(user.id, "home.welcome_back"), reply_markup=main_menu)
+    await _go_home(update.message, user)
 
 
 # ==========================================
@@ -1255,14 +1459,14 @@ async def cancel(
         await update.message.reply_text(
             "❌ Cancelled\n\n"
             "The pending action was cancelled.",
-            reply_markup=main_menu
+            reply_markup=_reply_menu_for(user.id)
         )
 
     else:
 
         await update.message.reply_text(
             "ℹ Nothing to cancel.",
-            reply_markup=main_menu
+            reply_markup=_reply_menu_for(user.id)
         )
 
 
@@ -1290,24 +1494,99 @@ async def menu_handler(
     )
 
     # ======================================
-    # PRE-LOGIN MENU
-    # (Connect / Guide / Tour) - available regardless of connection
-    # status, since Connect is how a user gets past this gate.
+    # UNCONNECTED MENU (UX-NAV-01 92.2) + legacy pre-login menu.
+    # Available regardless of connection status (Connect is how a user
+    # gets past this gate; How It Works / Why Connect / Subscription /
+    # Support make sense before connecting too).
     # ======================================
 
-    if text == BTN_CONNECT_NOW:
-
+    if text in (BTN_CONNECT_NOW, MB_CONNECT_ACCOUNT):
         _reset_waiting_states(user.id)
         await _start_connect_flow(message, user.id)
         return
 
-    if text == BTN_GUIDE:
+    if text == MB_WHY_CONNECT:
+        await message.reply_text(i18n.t(user.id, "nav.why_connect"),
+                                 reply_markup=_reply_menu_for(user.id))
+        return
+
+    if text == MB_SUBSCRIPTION_PLAN:
+        await _send_plan_screen(message, user.id, edit=False)
+        return
+
+    if text in (BTN_GUIDE, MB_HOW_IT_WORKS):
         await _send_guide(message)
         return
 
     if text == BTN_TOUR:
         await _send_tour(message)
         return
+
+    if text == MB_SUPPORT:
+        await _send_support_hub(message, user.id, edit=False)
+        return
+
+    if text in (MB_HOME,):
+        # Legacy "🏠 Home" reply-menu button (old keyboards): safe
+        # account-state Home.
+        await _go_home(message, user)
+        return
+
+    # ======================================
+    # MAIN MENU NAVIGATION - handled BEFORE any waiting-state capture
+    # so a menu press always wins (UX-NAV-01/02: menus are escape
+    # hatches; stale connected-menu presses from an unconnected user
+    # hit the login gate below instead of being swallowed).
+    # ======================================
+
+    if text in CONNECTED_MENU_LABELS:
+
+        # LOGIN GATE (see the full explanation further down; the
+        # authenticated menu is only valid for connected accounts).
+        if user.id not in ADMIN_IDS and not user_sessions.is_connected(user.id):
+            await message.reply_text(
+                "🔒 Connect your Telegram account first.",
+                reply_markup=pre_login_menu
+            )
+            return
+
+        _reset_waiting_states(user.id)
+
+        if text in (BTN_NEW_PROJECT,):
+            # Legacy creation entry; the task hub uses the ➕ New Task
+            # inline button (callback newproj) which reaches the same
+            # name-capture step below.
+            WAITING_PROJECT_NAME[user.id] = True
+            await message.reply_text("📝 Send Project Name")
+            return
+
+        if text in (BTN_MY_PROJECTS, MB_PROJECTS):
+            await _show_task_list(message, user.id)
+            return
+
+        if text == BTN_STATUS:
+            await _send_status(message, user.id)
+            return
+
+        if text in (BTN_MY_PLAN, MB_SUBSCRIPTION):
+            await _send_plan_screen(message, user.id)
+            return
+
+        if text in (BTN_SETTINGS, MB_SETTINGS):
+            await _send_settings_screen(message, user.id)
+            return
+
+        if text == MB_REWARDS:
+            await _show_rewards(message, context, user.id)
+            return
+
+        if text == MB_ACCOUNT:
+            await _send_account_card(message, user)
+            return
+
+        if text == MB_HOME:
+            await _go_home(message, user)
+            return
 
     # ======================================
     # CONNECT FLOW (phone / code / password capture)
@@ -1321,6 +1600,30 @@ async def menu_handler(
 
     if user.id in WAITING_CONNECT_STAGE:
         await _handle_connect_code_or_password(message, user.id, text)
+        return
+
+    # ======================================
+    # SUPPORT HUB TEXT INPUTS (available pre-login too)
+    # ======================================
+
+    if user.id in WAITING_SUPPORT_AI:
+        await _handle_support_ai_message(message, user.id, text)
+        return
+
+    if user.id in WAITING_TICKET_SUBJECT:
+        await _handle_ticket_subject(message, user.id, text)
+        return
+
+    if user.id in WAITING_TICKET_MESSAGE:
+        await _handle_ticket_message(message, user.id, text)
+        return
+
+    if user.id in WAITING_TICKET_REPLY:
+        await _handle_ticket_reply(message, user.id, text)
+        return
+
+    if user.id in WAITING_FEEDBACK:
+        await _handle_feedback_message(message, user.id, text)
         return
 
     # ======================================
@@ -1349,48 +1652,6 @@ async def menu_handler(
         )
 
         return
-
-    # ======================================
-    # MAIN MENU NAVIGATION
-    # (always takes priority and clears any
-    # pending waiting-state so the user can
-    # never get permanently stuck)
-    # ======================================
-
-    if text in MAIN_MENU_BUTTONS:
-
-        _reset_waiting_states(user.id)
-
-        if text == BTN_NEW_PROJECT:
-
-            WAITING_PROJECT_NAME[user.id] = True
-
-            await message.reply_text(
-                "📝 Send Project Name"
-            )
-
-            return
-
-        if text == BTN_MY_PROJECTS:
-            await _send_my_projects(message, user.id)
-            return
-
-        if text == BTN_STATUS:
-            await _send_status(message, user.id)
-            return
-
-        if text == BTN_MY_PLAN:
-            await _send_my_plan(message, user.id)
-            return
-
-        if text == BTN_SETTINGS:
-
-            await message.reply_text(
-                "⚙ ChannelFlow Settings",
-                reply_markup=settings_keyboard(wallet_service.is_auto_renew_enabled(user.id))
-            )
-
-            return
 
     # ======================================
     # CREATE PROJECT
@@ -1513,7 +1774,7 @@ async def menu_handler(
     await message.reply_text(
         "❓ I didn't understand that.\n\n"
         "Please use the menu below.",
-        reply_markup=main_menu
+        reply_markup=_reply_menu_for(user.id)
     )
 
 
@@ -1521,62 +1782,244 @@ async def menu_handler(
 # MENU BRANCH IMPLEMENTATIONS
 # ==========================================
 
-async def _send_my_projects(message, user_id):
+# ==========================================
+# UX-NAV-02: TASK-FIRST SCREENS
+# ==========================================
 
+def _task_status_label(project):
+    """'🟢 Running' / '⚪ Stopped' - shared by list and detail views."""
+    return "🟢 Running" if project["status"] else "⚪ Stopped"
+
+
+def _task_summary_text(project):
+    """Compact Task-Details card (UX-NAV-02 93.2): status + route
+    summary. Advanced configuration lives behind ⚙️ Edit Task."""
+    sources_total = count_sources(project["id"])
+    destinations_total = count_destinations(project["id"])
+    if "platform_type" in project.keys():
+        platform_type = project["platform_type"] or "telegram"
+    else:
+        platform_type = "telegram"
+    return i18n.t(
+        project["user_id"], "task.details",
+        name=project["name"],
+        status=_task_status_label(project),
+        route=_platform_label(platform_type),
+        sources=sources_total,
+        destinations=destinations_total,
+    )
+
+
+async def _show_task_list(message, user_id, edit=False):
+    """📁 Projects = the task list FIRST (UX-NAV-02 93.1), with an
+    empty state (Create Your First Task) when there are zero tasks.
+    Rendered through nav_state.place so repeated navigation replaces
+    the previous bot screen message instead of stacking duplicates."""
     projects = get_projects(user_id)
+    allowed, _reason = plan_service.can_create_project(user_id)
 
     if not projects:
+        text = i18n.t(user_id, "nav.tasks_empty")
+        markup = task_list_keyboard([], can_create=allowed)
+    else:
+        text = i18n.t(user_id, "nav.your_tasks")
+        markup = task_list_keyboard(projects, can_create=allowed)
 
-        await message.reply_text(
-            "❌ No Projects Found\n\n"
-            "Tap ➕ New Project to create one."
-        )
+    await nav_state.place(message, user_id, "tasks", text, reply_markup=markup, edit=edit)
 
+
+async def _show_task_detail(message, project_id, user_id, edit=False, notice=None):
+    """Task Details card (compact). ``notice`` prefixes an optional
+    one-line confirmation (Task started / stopped / deleted)."""
+    project = _get_owned_project(project_id, user_id)
+    if project is None:
+        # Ownership or existence failed (deleted / other user): safe
+        # "screen expired" answer with a way Home (UX-NAV-02 93.4).
+        text = "⚠️ " + i18n.t(user_id, "nav.screen_expired")
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="nav:home")]])
+        if edit:
+            try:
+                await message.edit_text(text, reply_markup=markup)
+            except Exception:
+                await message.reply_text(text, reply_markup=markup)
+        else:
+            await message.reply_text(text, reply_markup=markup)
+        return None
+
+    body = _task_summary_text(project)
+    text = f"{notice}\n\n{body}" if notice else body
+    running = bool(project["status"])
+    platform_type = project["platform_type"] if "platform_type" in project.keys() else "telegram"
+    markup = task_detail_keyboard(project_id, running=running, platform_type=platform_type)
+    return await nav_state.place(
+        message, user_id, f"task_detail:{project_id}", text, reply_markup=markup, edit=edit,
+        data={"project_id": project_id},
+    )
+
+
+async def _show_edit_task(message, project_id, user_id, edit=False):
+    """⚙️ Edit Task root: the task's configuration grouped by area,
+    each with live handlers only (UX-NAV-02 93.2 / 92.5)."""
+    project = _get_owned_project(project_id, user_id)
+    if project is None:
+        await _show_task_detail(message, project_id, user_id, edit=edit)
         return
 
-    for project in projects:
+    sources_total = count_sources(project["id"])
+    destinations_total = count_destinations(project["id"])
+    platform_type = project["platform_type"] if "platform_type" in project.keys() else "telegram"
 
-        await message.reply_text(
-            _project_card_text(project),
-            reply_markup=project_keyboard(
-                project["id"], running=bool(project["status"]), platform_type=project["platform_type"]
-            )
-        )
+    text = (
+        f"⚙️ Edit Task — {project['name']}\n\n"
+        f"Status: {_task_status_label(project)}\n"
+        f"Route: {_platform_label(platform_type)}\n"
+        f"Sources: {sources_total}\n"
+        f"Destinations: {destinations_total}\n\n"
+        "Choose an area to configure:"
+    )
+    markup = edit_project_keyboard(project_id, platform_type=platform_type)
+    return await nav_state.place(
+        message, user_id, f"edit_task:{project_id}", text, reply_markup=markup, edit=edit,
+        data={"project_id": project_id},
+    )
 
 
-async def _send_my_plan(message, user_id):
+async def _confirm_delete_task(message, project_id, user_id, edit=False):
+    """Destructive confirmation before deleting a task (UX-NAV-02
+    93.2). Delete always requires this confirmation step."""
+    project = _get_owned_project(project_id, user_id)
+    if project is None:
+        await _show_task_detail(message, project_id, user_id, edit=edit)
+        return
 
-    entitlements = plan_service.get_entitlements(user_id)
+    text = i18n.t(user_id, "task.delete_confirm", name=project["name"])
+    markup = delete_confirm_keyboard(f"delete:{project_id}", f"projcard:{project_id}")
+    return await nav_state.place(
+        message, user_id, f"delete_confirm:{project_id}", text, reply_markup=markup, edit=edit,
+        data={"project_id": project_id},
+    )
 
+
+# Legacy alias kept for older call sites / tests.
+_send_my_projects = _show_task_list
+
+
+def _plan_limits_text(entitlements):
     def _fmt(v):
         return "Unlimited" if v is None else str(v)
-
-    projects = get_projects(user_id)
-
-    upgrade_plan_note = ""
-    if entitlements["plan"] in ("FREE", "BEGINNER"):
-        upgrade_plan_note = "\n\n🔒 " + (
-            "Available on Pro & Creator."
-            if entitlements["plan"] == "FREE"
-            else "Upgrade to Pro for full access."
-        )
 
     lines = [
         f"📦 Plan: {entitlements['plan']}",
         "",
-        f"📂 Projects: {len(projects)} / {_fmt(entitlements['max_projects'])}",
+        f"📂 Projects: {_fmt(entitlements['max_projects'])}",
         f"📡 Sources per project: {_fmt(entitlements['max_sources_per_project'])}",
         f"🎯 Destinations per project: {_fmt(entitlements['max_destinations_per_project'])}",
         f"📈 Daily forwards per project: {_fmt(entitlements['daily_forward_limit'])}",
         f"🏷 Attribution footer: {'Required' if entitlements['requires_attribution'] else 'Not required'}",
-        upgrade_plan_note,
     ]
+    return "\n".join(lines)
 
-    if entitlements["plan"] == "FREE":
+
+async def _send_plan_screen(message, user_id, edit=False):
+    """💳 Plan & Billing card. Unconnected users see the plan catalog
+    with a Connect CTA; connected users see their entitlements plus
+    live upgrade/wallet/rewards actions. Telegram Stars is mentioned
+    as text only - checkout is not implemented, so no dead Stars
+    buttons are ever rendered (UX-NAV-01 92.5 companion defect)."""
+    entitlements = plan_service.get_entitlements(user_id)
+    connected = user_id in ADMIN_IDS or user_sessions.is_connected(user_id)
+    projects = get_projects(user_id)
+
+    if not connected:
+        # Plan catalog for prospective users (unconnected state).
+        lines = ["💎 Subscription Plans\n"]
+        configs = plan_service.get_cached_plan_configs()
+        for plan_name in plan_service.VALID_PLANS:
+            cfg = configs.get(plan_name)
+            if not cfg:
+                continue
+            inr = cfg.get("monthly_price_inr")
+            usd = plan_service.get_plan_crypto_price_usd(plan_name)
+            price_line = f"₹{inr:.0f}/mo" if inr else ("$" + f"{usd:.2f}/mo" if usd else "—")
+            lines.append(f"• {cfg.get('display_name', plan_name)} — {price_line}")
         lines.append("")
-        lines.append("Contact the admin to upgrade your plan.")
+        lines.append("⭐ Telegram Stars payments are not available yet - "
+                     "subscribe via UPI or crypto after connecting.")
+        lines.append("")
+        lines.append("Connect your Telegram account first, then upgrade from here.")
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Connect Account", callback_data="acct:connect")],
+            [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+        ])
+        return await nav_state.place(message, user_id, "plan", "\n".join(lines),
+                                     reply_markup=markup, edit=edit)
 
-    await message.reply_text("\n".join(lines))
+    used_projects = len(projects)
+    text = (
+        f"{_plan_limits_text(entitlements)}\n"
+        f"\n"
+        f"Using: {used_projects} / {_fmt_limit(entitlements['max_projects'])} projects"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬆️ Upgrade Plan", callback_data="acct:upgrade")],
+        [
+            InlineKeyboardButton("💰 Wallet", callback_data="acct:wallet"),
+            InlineKeyboardButton("👥 Rewards", callback_data="acct:earn"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            InlineKeyboardButton("⬅ Account", callback_data="nav:account"),
+        ],
+    ])
+    return await nav_state.place(message, user_id, "plan", text, reply_markup=markup, edit=edit)
+
+
+def _fmt_limit(v):
+    return "Unlimited" if v is None else str(v)
+
+
+async def _send_my_plan(message, user_id):
+    return await _send_plan_screen(message, user_id, edit=False)
+
+
+async def _send_settings_screen(message, user_id, edit=False):
+    """⚙️ Settings hub (canonical; live rows only)."""
+    text = "⚙ ChannelFlow Settings"
+    markup = settings_keyboard(wallet_service.is_auto_renew_enabled(user_id))
+    return await nav_state.place(message, user_id, "settings", text, reply_markup=markup, edit=edit)
+
+
+async def _show_rewards(message, context, user_id, edit=False):
+    """🎁 Rewards (referrals) screen - real link, real stats."""
+    bot_username = context.bot.username
+    code = referral_service.build_referral_code(user_id)
+    link = f"https://t.me/{bot_username}?start={code}"
+    stats = referral_service.get_referral_stats(user_id)
+
+    text = (
+        "🎁 Rewards\n\n"
+        "Share your link. When someone joins through it and upgrades "
+        f"to PRO, you get +{referral_service.REFERRAL_REWARD_DAYS} days of PRO "
+        "- for every person who does, stacking.\n\n"
+        f"{link}\n\n"
+        f"Total invited: {stats['total_invited']}\n"
+        f"Rewarded so far: {stats['active_referrals']}"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Share Link", url=link)],
+        [
+            InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            InlineKeyboardButton("⬅ Account", callback_data="nav:account"),
+        ],
+    ])
+    return await nav_state.place(message, user_id, "rewards", text, reply_markup=markup, edit=edit)
+
+
+async def _send_support_hub(message, user_id, edit=False, is_creator=False):
+    """🆘 Support hub (available pre- and post-login)."""
+    text = i18n.t(user_id, "support.why_connect_hint")
+    markup = support_section_keyboard(user_id=user_id, is_creator=is_creator)
+    return await nav_state.place(message, user_id, "support", text, reply_markup=markup, edit=edit)
 
 
 async def _send_status(message, user_id):
@@ -2421,8 +2864,251 @@ async def _handle_broadcast(message, context, admin_id, text):
 
 
 # ==========================================
+# HELP / KNOWLEDGE + SUPPORT TICKETS (UX-NAV companion)
+# ==========================================
+
+def _row_get(row, key, default=None):
+    """sqlite3.Row access without KeyError risk."""
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
+async def _send_articles(message, user_id, kind="faq", edit=False):
+    """❓ FAQ / 📖 Guide content from the knowledge base."""
+    rows = knowledge_service.list_articles(kind=kind, active_only=True)
+    title = "❓ FAQ" if kind == "faq" else "📖 Guide"
+
+    if not rows:
+        text = f"{title}\n\nNo articles published yet - check back soon."
+    else:
+        lines = [title]
+        for art in rows[:8]:
+            body = (_row_get(art, "body") or "").strip()
+            if len(body) > 420:
+                body = body[:417] + "..."
+            lines.append(f"\n📌 {_row_get(art, 'title') or '-'}\n{body}")
+        if len(rows) > 8:
+            lines.append(f"\n… and {len(rows) - 8} more. Ask in Support AI for details.")
+        text = "\n".join(lines)
+
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬅ Support", callback_data="nav:help"),
+            InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+        ]
+    ])
+    return await nav_state.place(message, user_id, f"help_{kind}", text,
+                                 reply_markup=markup, edit=edit)
+
+
+async def _render_tickets_list(message, user_id, edit=True):
+    tickets = support_service.list_user_tickets(user_id, limit=10)
+
+    if not tickets:
+        text = "🎫 My Support Tickets\n\nNo tickets yet."
+        rows = [[InlineKeyboardButton("➕ New Ticket", callback_data="support:new")]]
+    else:
+        text_lines = ["🎫 My Support Tickets", ""]
+        rows = []
+        for t in tickets:
+            icon = support_service.STATUS_ICONS.get(_row_get(t, "status"), "•")
+            subject = (_row_get(t, "subject") or "Ticket")[:42]
+            text_lines.append(f"{icon} #{_row_get(t, 'id')} · {subject}")
+            rows.append([InlineKeyboardButton(
+                f"{icon} #{_row_get(t, 'id')} {subject}", callback_data=f"support:view:{_row_get(t, 'id')}"
+            )])
+        rows.append([InlineKeyboardButton("➕ New Ticket", callback_data="support:new")])
+        text = "\n".join(text_lines)
+
+    rows.append([
+        InlineKeyboardButton("⬅ Support", callback_data="nav:help"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ])
+    return await nav_state.place(message, user_id, "tickets", text,
+                                 reply_markup=InlineKeyboardMarkup(rows), edit=edit)
+
+
+async def _render_ticket_screen(message, ticket_id, user_id, edit=True):
+    ticket = support_service.get_ticket(ticket_id)
+    if ticket is None or _row_get(ticket, "user_id") != user_id:
+        if edit:
+            try:
+                await message.edit_text(
+                    "⚠️ " + i18n.t(user_id, "nav.screen_expired"),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🏠 Home", callback_data="nav:home")]
+                    ]),
+                )
+            except Exception:
+                pass
+        else:
+            await message.reply_text("🎫 Ticket not found.")
+        return None
+
+    icon = support_service.STATUS_ICONS.get(_row_get(ticket, "status"), "•")
+    lines = [
+        f"🎫 Ticket #{ticket_id} — {_row_get(ticket, 'category')}",
+        f"Status: {icon} {_row_get(ticket, 'status')}",
+        "",
+        f"📌 {_row_get(ticket, 'subject')}",
+    ]
+
+    messages = support_service.get_messages(ticket_id) or []
+    for msg in messages[-8:]:
+        who = "👤 You" if _row_get(msg, "sender_type") == "user" else "🛟 Support"
+        when = (_row_get(msg, "created_at") or "")[:16]
+        body = (_row_get(msg, "message") or "").strip()
+        if len(body) > 500:
+            body = body[:497] + "..."
+        lines.append(f"\n{who} · {when}\n{body}")
+
+    if not messages:
+        lines.append("\n(no messages yet)")
+
+    status = _row_get(ticket, "status")
+    markup = support_ticket_keyboard(ticket_id, status)
+    return await nav_state.place(message, user_id, f"ticket:{ticket_id}", "\n".join(lines),
+                                 reply_markup=markup, edit=edit)
+
+
+_TICKET_CATEGORY_LABELS = {
+    "general": "💬 General",
+    "billing": "💳 Billing / Payments",
+    "forwarding": "🔁 Forwarding Problem",
+    "connection": "🔗 Connection / Login",
+    "feature": "💡 Feature Request",
+}
+
+
+async def _handle_support_callback(query, context, user_id, sub, parts):
+    """Support hub + ticket flows. All data is read/written strictly
+    for the calling user (tickets are ownership-checked)."""
+
+    if sub == "ai":
+        _reset_waiting_states(user_id)
+        WAITING_SUPPORT_AI[user_id] = True
+        text = (
+            "🤖 Support AI\n\n"
+            "Ask me anything about ChannelFlow - plans, limits, how to "
+            "set up sources and destinations...\n\n"
+            "Send your question below (or press 🏠 Home / send /cancel "
+            "to stop the chat)."
+        )
+        await nav_state.place(query.message, user_id, "support_ai", text,
+                              reply_markup=None, edit=True)
+        return
+
+    if sub == "group":
+        text = (
+            "Support Team\n\n"
+            "ChannelFlow AI Support: https://t.me/ChannelFlowSupport_bot\n\n"
+            "For tracked help prefer 💬 New Support Ticket - replies come "
+            "here in the chat."
+        )
+        await nav_state.place(query.message, user_id, "support_group", text,
+                              reply_markup=InlineKeyboardMarkup([[
+                                  InlineKeyboardButton("⬅ Support", callback_data="nav:help"),
+                                  InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                              ]]), edit=True)
+        return
+
+    if sub == "owner":
+        text = (
+            "👑 Owner\n\n"
+            "Owner-level help is handled through the /owner panel. "
+            "Open /owner in this chat to see owner options."
+        )
+        await nav_state.place(query.message, user_id, "support_owner", text,
+                              reply_markup=InlineKeyboardMarkup([[
+                                  InlineKeyboardButton("⬅ Support", callback_data="nav:help"),
+                                  InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                              ]]), edit=True)
+        return
+
+    if sub == "list":
+        await _render_tickets_list(query.message, user_id, edit=True)
+        return
+
+    if sub == "view":
+        ticket_id = int(parts[2])
+        await _render_ticket_screen(query.message, ticket_id, user_id, edit=True)
+        return
+
+    if sub == "reply":
+        ticket_id = int(parts[2])
+        ticket = support_service.get_ticket(ticket_id)
+        if ticket is None or _row_get(ticket, "user_id") != user_id:
+            await query.answer("⚠ Ticket not found.", show_alert=True)
+            return
+        WAITING_TICKET_REPLY[user_id] = ticket_id
+        try:
+            await query.edit_message_text(
+                f"✉️ Reply to ticket #{ticket_id}\n\nSend your reply text:"
+            )
+        except Exception:
+            await query.message.reply_text("✉️ Send your reply text:")
+        return
+
+    if sub in ("close", "reopen"):
+        ticket_id = int(parts[2])
+        ticket = support_service.get_ticket(ticket_id)
+        if ticket is None or _row_get(ticket, "user_id") != user_id:
+            await query.answer("⚠ Ticket not found.", show_alert=True)
+            return
+        support_service.set_status(ticket_id, "closed" if sub == "close" else "open")
+        await _render_ticket_screen(query.message, ticket_id, user_id, edit=True)
+        return
+
+    if sub == "new":
+        buttons = []
+        for cat in support_service.CATEGORIES:
+            label = _TICKET_CATEGORY_LABELS.get(cat, cat.capitalize())
+            buttons.append([InlineKeyboardButton(label, callback_data=f"support:newcat:{cat}")])
+        buttons.append([
+            InlineKeyboardButton("⬅ Support", callback_data="nav:help"),
+            InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+        ])
+        await nav_state.place(
+            query.message, user_id, "ticket_new",
+            "🎫 New Support Ticket\n\nWhat is your request about?",
+            reply_markup=InlineKeyboardMarkup(buttons), edit=True,
+        )
+        return
+
+    if sub == "newcat":
+        cat = parts[2] if len(parts) > 2 else "general"
+        WAITING_TICKET_SUBJECT[user_id] = {"category": cat}
+        try:
+            await query.edit_message_text(
+                "📝 Send a short subject for your ticket "
+                "(max 200 characters), or /cancel to abort."
+            )
+        except Exception:
+            await query.message.reply_text("📝 Send a short subject, or /cancel to abort.")
+        return
+
+    # Unknown support sub-action -> hub again.
+    await _send_support_hub(query.message, user_id, edit=True, is_creator=user_id in ADMIN_IDS)
+
+
+# ==========================================
 # INLINE KEYBOARD (CALLBACK) HANDLER
 # ==========================================
+
+async def _reply_stale_callback(query, text):
+    """Safe dead-end answer for stale/unhandled callbacks: always gives
+    the user a way Home (UX-NAV-02 93.4) instead of stranding them."""
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="nav:home")]])
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except Exception:
+        try:
+            await query.message.reply_text(text, reply_markup=markup)
+        except Exception:
+            pass
+
 
 async def button_handler(
     update: Update,
@@ -2447,6 +3133,279 @@ async def button_handler(
 
         if action == "promo":
             await handle_promo_callback(query, context, user_id, parts)
+            return
+
+        # ======================================
+        # UX-NAV: CENTRAL NAVIGATION (92.4 / 93.4)
+        # ======================================
+
+        if action == "nav":
+            sub = parts[1] if len(parts) > 1 else "home"
+            _reset_waiting_states(user_id)
+            if sub == "home":
+                await _go_home(query.message, query.from_user, edit=True)
+            elif sub == "projects":
+                await _show_task_list(query.message, user_id, edit=True)
+            elif sub == "account":
+                await _show_account_hub(query.message, query.from_user, edit=True)
+            elif sub == "settings":
+                await _send_settings_screen(query.message, user_id, edit=True)
+            elif sub == "help":
+                await _send_support_hub(query.message, user_id, edit=True,
+                                        is_creator=user_id in ADMIN_IDS)
+            else:
+                await _go_home(query.message, query.from_user, edit=True)
+            return
+
+        # ======================================
+        # LANGUAGE (first-run picker + Settings -> Language)
+        # ======================================
+
+        if action == "lang":
+            lang = parts[1] if len(parts) > 1 else None
+            first_run = not _language_chosen(user_id)
+
+            if not i18n.set_user_language(user_id, lang):
+                await query.answer("⚠ Invalid language.", show_alert=True)
+                return
+
+            saved = i18n.t(user_id, "lang.saved")
+
+            if first_run:
+                # Onboarding continues straight into the account-state
+                # Home with the right persistent menu attached.
+                try:
+                    await query.edit_message_text(saved)
+                except Exception:
+                    await query.message.reply_text(saved)
+                await _go_home(query.message, query.from_user)
+            else:
+                await query.answer(i18n.t(user_id, "language.updated"))
+                try:
+                    await query.edit_message_text(
+                        saved,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⚙️ Settings", callback_data="nav:settings")],
+                            [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+                        ]),
+                    )
+                except Exception:
+                    pass
+            return
+
+        # ======================================
+        # NEW TASK (task-list ➕ New Task)
+        # ======================================
+
+        if action == "newproj":
+            allowed, reason = plan_service.can_create_project(user_id)
+            if not allowed:
+                await query.answer(f"🔒 {reason}", show_alert=True)
+                return
+            _reset_waiting_states(user_id)
+            WAITING_PROJECT_NAME[user_id] = True
+            try:
+                await query.edit_message_text(
+                    "📝 Send Task Name\n\n"
+                    "(e.g. Deals Channel → Backup Group)\n\n"
+                    "Send /cancel to abort."
+                )
+            except Exception:
+                await query.message.reply_text("📝 Send Task Name")
+            return
+
+        # ======================================
+        # TASK DETAILS (projcard: from the task list)
+        # ======================================
+
+        if action == "projcard":
+            project_id = int(parts[1])
+            _reset_waiting_states(user_id)
+            await _show_task_detail(query.message, project_id, user_id, edit=True)
+            return
+
+        # ======================================
+        # EDIT TASK ROOT
+        # ======================================
+
+        if action == "editproj":
+            project_id = int(parts[1])
+            _reset_waiting_states(user_id)
+            await _show_edit_task(query.message, project_id, user_id, edit=True)
+            return
+
+        # ======================================
+        # DELETE TASK - confirmation required (93.2)
+        # ======================================
+
+        if action == "deleteconfirm":
+            project_id = int(parts[1])
+            _reset_waiting_states(user_id)
+            await _confirm_delete_task(query.message, project_id, user_id, edit=True)
+            return
+
+        # ======================================
+        # DELETE SOURCE / DESTINATION - confirmations
+        # ======================================
+
+        if action == "deletesourceconfirm":
+            source_id, project_id = int(parts[1]), int(parts[2])
+            source, project = _get_owned_source(source_id, user_id)
+            if source is None:
+                await query.answer("⚠ Source not found.", show_alert=True)
+                return
+            text = (
+                f"⚠️ Disconnect this source?\n\n"
+                f"📂 {source['title'] or source['chat_id']}\n"
+                f"👤 @{source['username'] or '-'}\n\n"
+                "Messages will stop coming from it."
+            )
+            markup = delete_confirm_keyboard(f"deletesource:{source_id}", f"listsource:{project_id}")
+            await nav_state.place(query.message, user_id, f"delete_source:{source_id}",
+                                  text, reply_markup=markup, edit=True)
+            return
+
+        if action == "deletedestinationconfirm":
+            destination_id, project_id = int(parts[1]), int(parts[2])
+            destination, project = _get_owned_destination(destination_id, user_id)
+            if destination is None:
+                await query.answer("⚠ Destination not found.", show_alert=True)
+                return
+            text = (
+                f"⚠️ Disconnect this destination?\n\n"
+                f"📂 {destination['title'] or destination['chat_id']}\n"
+                f"👤 @{destination['username'] or '-'}\n\n"
+                "Messages will stop being sent to it."
+            )
+            markup = delete_confirm_keyboard(
+                f"deletedestination:{destination_id}", f"listdestination:{project_id}"
+            )
+            await nav_state.place(query.message, user_id, f"delete_destination:{destination_id}",
+                                  text, reply_markup=markup, edit=True)
+            return
+
+        # ======================================
+        # SUPPORT HUB + HELP (available pre-login too)
+        # ======================================
+
+        if action == "help":
+            sub = parts[1] if len(parts) > 1 else "faq"
+
+            if sub == "faq":
+                await _send_articles(query.message, user_id, kind="faq", edit=True)
+                return
+
+            if sub == "guide":
+                await _send_articles(query.message, user_id, kind="guide", edit=True)
+                return
+
+            if sub == "tour":
+                await _send_tour(query.message)
+                return
+
+            if sub == "feedback":
+                WAITING_FEEDBACK[user_id] = True
+                try:
+                    await query.edit_message_text(
+                        "💡 Feature Request\n\n"
+                        "Describe the feature you'd like (a few lines is enough)."
+                    )
+                except Exception:
+                    await query.message.reply_text("💡 Describe the feature you'd like.")
+                return
+
+            await _send_support_hub(query.message, user_id, edit=True,
+                                    is_creator=user_id in ADMIN_IDS)
+            return
+
+        if action == "support":
+            sub = parts[1] if len(parts) > 1 else "hub"
+            await _handle_support_callback(query, context, user_id, sub, parts)
+            return
+
+        # ======================================
+        # FILTER SUBSCREENS (Keywords / Domains / Senders)
+        # ======================================
+
+        if action in ("filterkw", "filterdomains", "filtersenders"):
+            project_id = int(parts[1])
+            project = _get_owned_project(project_id, user_id)
+            if project is None:
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
+                return
+
+            settings = settings_service.get_settings(project_id)
+            content_rules = content_rules_service.get_rules(project_id)
+            header = f"🧹 {project['name']}"
+
+            if action == "filterkw":
+                text = (
+                    f"{header} — Keyword Filters\n\n"
+                    "Required: only messages containing at least one of "
+                    "these keywords pass.\n"
+                    "Blocked: messages containing any are skipped."
+                )
+                markup = keyword_filter_keyboard(project_id, settings)
+                name = f"filters_keywords:{project_id}"
+            elif action == "filterdomains":
+                text = (
+                    f"{header} — Domain Filters\n\n"
+                    "Whitelist: only messages linking to these domains "
+                    "pass.\nBlacklist: links to these are skipped."
+                )
+                markup = domain_filter_keyboard(project_id, content_rules)
+                name = f"filters_domains:{project_id}"
+            else:
+                text = (
+                    f"{header} — Sender Filters\n\n"
+                    "Allow: only these sender IDs pass (groups).\n"
+                    "Block: these sender IDs are skipped."
+                )
+                markup = sender_filter_keyboard(project_id, content_rules)
+                name = f"filters_senders:{project_id}"
+
+            await nav_state.place(query.message, user_id, name, text, reply_markup=markup, edit=True)
+            return
+
+        # ======================================
+        # CLEAR ALL FILTERS - confirmation required
+        # ======================================
+
+        if action == "clearfiltersconfirm":
+            project_id = int(parts[1])
+            project = _get_owned_project(project_id, user_id)
+            if project is None:
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
+                return
+            text = (
+                f"⚠️ Clear ALL filters for {project['name']}?\n\n"
+                "Media type, keywords, domains, senders, regex and "
+                "content rules will be reset."
+            )
+            markup = delete_confirm_keyboard(f"clearfilters:{project_id}", f"projfilters:{project_id}")
+            await nav_state.place(query.message, user_id, f"clear_filters:{project_id}",
+                                  text, reply_markup=markup, edit=True)
+            return
+
+        # ======================================
+        # FORMATTING ROOT (Back-to-Formatting target)
+        # ======================================
+
+        if action == "fmtroot":
+            project_id = int(parts[1])
+            project = _get_owned_project(project_id, user_id)
+            if project is None:
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
+                return
+            rules = formatting_service.get_rules(project_id)
+            text = (
+                f"📝 Formatting — {project['name']}\n\n"
+                "Applies in Telegram Copy mode and to Instagram captions. "
+                "Native Telegram Forward mode can't have its content "
+                "edited, so formatting never applies there."
+            )
+            await nav_state.place(query.message, user_id, f"formatting:{project_id}",
+                                  text, reply_markup=formatting_keyboard(project_id, rules), edit=True)
             return
 
         # ======================================
@@ -2475,11 +3434,62 @@ async def button_handler(
                 return
 
             if sub == "support":
-                await query.message.reply_text(
-                    "❓ Support\n\n"
-                    "Contact: ChannelFlow AI Support Team\n"
-                    "https://t.me/ChannelFlowSupport_bot"
+                await _send_support_hub(query.message, user_id, edit=True,
+                                        is_creator=user_id in ADMIN_IDS)
+                return
+
+            if sub == "plan":
+                await _send_plan_screen(query.message, user_id, edit=True)
+                return
+
+            if sub == "wallet":
+                balance_usd = wallet_service.get_balance(user_id)
+                inr = balance_usd * pricing_service.INR_PER_USD
+                text = (
+                    f"💰 Wallet Balance: ${balance_usd:.2f} (≈ ₹{inr:.0f})\n\n"
+                    "Used for Auto-Renew - top up here, an admin approves "
+                    "it the same way as a plan payment, then it's available."
                 )
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add Funds", callback_data="wallet:topup")],
+                    [
+                        InlineKeyboardButton("⬅ Account", callback_data="nav:account"),
+                        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                    ],
+                ])
+                await nav_state.place(query.message, user_id, "wallet", text,
+                                      reply_markup=markup, edit=True)
+                return
+
+            if sub == "connections":
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT phone_number FROM user_telegram_sessions "
+                    "WHERE telegram_id=? AND status='connected'",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                conn.close()
+                phone = row["phone_number"] if row else None
+                text = (
+                    "🔗 Connected Accounts\n\n"
+                    f"✈️ Telegram: {phone or 'None'}\n\n"
+                    "Your Telegram session is encrypted and powers your "
+                    "forwarding tasks. WhatsApp/Threads platforms are not "
+                    "live yet."
+                )
+                buttons = []
+                if phone:
+                    buttons.append([InlineKeyboardButton(
+                        "🔌 Disconnect Telegram", callback_data="settings:disconnect"
+                    )])
+                buttons.append([
+                    InlineKeyboardButton("⬅ Account", callback_data="nav:account"),
+                    InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                ])
+                await nav_state.place(query.message, user_id, "connections", text,
+                                      reply_markup=InlineKeyboardMarkup(buttons), edit=True)
                 return
 
             if sub == "upgrade":
@@ -2502,32 +3512,21 @@ async def button_handler(
                 return
 
             if sub == "back":
-                await _send_account_card(query.message, query.from_user)
+                await _show_account_hub(query.message, query.from_user, edit=True)
                 return
 
             if sub == "earn":
-
-                bot_username = context.bot.username
-                code = referral_service.build_referral_code(user_id)
-                link = f"https://t.me/{bot_username}?start={code}"
-                stats = referral_service.get_referral_stats(user_id)
-
-                await query.message.reply_text(
-                    "🎁 Invite\n\n"
-                    "Share your link. When someone joins through it and "
-                    f"upgrades to PRO, you get +{referral_service.REFERRAL_REWARD_DAYS} days of PRO "
-                    "- for every person who does, stacking.\n\n"
-                    f"{link}\n\n"
-                    f"Total invited: {stats['total_invited']}\n"
-                    f"Rewarded so far: {stats['active_referrals']}"
-                )
+                await _show_rewards(query.message, context, user_id, edit=True)
                 return
 
             if sub == "language":
-                await query.answer(
-                    "🚧 Currently English only - more languages coming soon.",
-                    show_alert=True,
-                )
+                try:
+                    await query.edit_message_text(
+                        "🌐 Language\n\nChoose your language:",
+                        reply_markup=LANGUAGE_KEYBOARD,
+                    )
+                except Exception:
+                    await query.message.reply_text("🌐 Language", reply_markup=LANGUAGE_KEYBOARD)
                 return
 
             return
@@ -2961,7 +3960,11 @@ async def button_handler(
 
                 await query.message.reply_text(
                     "❌ No Sources Added\n\n"
-                    "Tap ➕ Source on the project dashboard to add one."
+                    "Tap ➕ Source on the task dashboard to add one.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),
+                        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                    ]]),
                 )
 
                 return
@@ -2996,7 +3999,11 @@ async def button_handler(
 
                 await query.message.reply_text(
                     "❌ No Destinations Added\n\n"
-                    "Tap ➕ Destination on the project dashboard to add one."
+                    "Tap ➕ Destination on the task dashboard to add one.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),
+                        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                    ]]),
                 )
 
                 return
@@ -3022,25 +4029,15 @@ async def button_handler(
             project = _get_owned_project(project_id, user_id)
 
             if project is None:
-                await query.message.reply_text("❌ Project Not Found")
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
                 return
 
             if count_sources(project_id) == 0:
-
-                await query.message.reply_text(
-                    "⚠ Cannot Start\n\n"
-                    "Add at least one source before starting."
-                )
-
+                await query.answer("⚠ Add at least one source before starting.", show_alert=True)
                 return
 
             if count_destinations(project_id) == 0:
-
-                await query.message.reply_text(
-                    "⚠ Cannot Start\n\n"
-                    "Add at least one destination before starting."
-                )
-
+                await query.answer("⚠ Add at least one destination before starting.", show_alert=True)
                 return
 
             update_status(project_id, 1)
@@ -3056,16 +4053,8 @@ async def button_handler(
             await client_pool.force_refresh_owner_routes(user_id)
 
             project = get_project(project_id)
-
-            await query.message.reply_text(
-
-                "🟢 Project Started\n\n"
-                f"📂 {project['name']}",
-
-                reply_markup=project_keyboard(project_id, running=True, platform_type=project["platform_type"])
-
-            )
-
+            notice = "🟢 " + i18n.t(user_id, "task.started", name=project["name"])
+            await _show_task_detail(query.message, project_id, user_id, edit=True, notice=notice)
             return
 
         # ======================================
@@ -3078,23 +4067,15 @@ async def button_handler(
             project = _get_owned_project(project_id, user_id)
 
             if project is None:
-                await query.message.reply_text("❌ Project Not Found")
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
                 return
 
             update_status(project_id, 0)
             await force_refresh_routes()
 
             project = get_project(project_id)
-
-            await query.message.reply_text(
-
-                "🔴 Project Stopped\n\n"
-                f"📂 {project['name']}",
-
-                reply_markup=project_keyboard(project_id, running=False, platform_type=project["platform_type"])
-
-            )
-
+            notice = "🔴 " + i18n.t(user_id, "task.stopped", name=project["name"])
+            await _show_task_detail(query.message, project_id, user_id, edit=True, notice=notice)
             return
 
         # ======================================
@@ -3115,14 +4096,16 @@ async def button_handler(
             delete_source(source_id)
             await force_refresh_routes()
 
-            await query.message.reply_text(
-
-                "✅ Source Deleted\n\n"
-                f"📂 {source['title'] or source['chat_id']}",
-
-                reply_markup=project_keyboard(project["id"], platform_type=project["platform_type"])
-
-            )
+            text = "✅ Source Removed\n\n" f"📂 {source['title'] or source['chat_id']}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅ Sources", callback_data=f"listsource:{project['id']}"),
+                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            ]])
+            try:
+                await query.edit_message_text(text, reply_markup=markup,
+                                              disable_web_page_preview=True)
+            except Exception:
+                await query.message.reply_text(text, reply_markup=markup)
 
             return
 
@@ -3144,14 +4127,16 @@ async def button_handler(
             delete_destination(destination_id)
             await force_refresh_routes()
 
-            await query.message.reply_text(
-
-                "✅ Destination Deleted\n\n"
-                f"📂 {destination['title'] or destination['chat_id']}",
-
-                reply_markup=project_keyboard(project["id"], platform_type=project["platform_type"])
-
-            )
+            text = "✅ Destination Removed\n\n" f"📂 {destination['title'] or destination['chat_id']}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅ Destinations", callback_data=f"listdestination:{project['id']}"),
+                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            ]])
+            try:
+                await query.edit_message_text(text, reply_markup=markup,
+                                              disable_web_page_preview=True)
+            except Exception:
+                await query.message.reply_text(text, reply_markup=markup)
 
             return
 
@@ -3259,7 +4244,7 @@ async def button_handler(
             project = _get_owned_project(project_id, user_id)
 
             if project is None:
-                await query.message.reply_text("❌ Project Not Found")
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
                 return
 
             delete_project(project_id)
@@ -3269,11 +4254,25 @@ async def button_handler(
                 _reset_waiting_states(user_id)
                 CURRENT_PROJECT.pop(user_id, None)
 
-            await query.message.reply_text(
-                "🗑 Project Deleted Successfully\n\n"
-                f"📂 {project['name']}"
-            )
+            nav_state.drop_screens_to(user_id, "tasks")
+            deleted_line = i18n.t(user_id, "task.deleted", name=project["name"])
 
+            # Refresh the task list in the same message - empty state
+            # when the last task was just deleted (UX-NAV-02 93.2).
+            can_create, _why = plan_service.can_create_project(user_id)
+            remaining = get_projects(user_id)
+            if not remaining:
+                text = f"{deleted_line}\n\n" + i18n.t(user_id, "nav.tasks_empty")
+                markup = task_list_keyboard([], can_create=can_create)
+            else:
+                text = f"{deleted_line}\n\n" + i18n.t(user_id, "nav.your_tasks")
+                markup = task_list_keyboard(remaining, can_create=can_create)
+
+            try:
+                await query.edit_message_text(text, reply_markup=markup,
+                                              disable_web_page_preview=True)
+            except Exception:
+                await query.message.reply_text(text, reply_markup=markup)
             return
 
         # ======================================
@@ -3319,10 +4318,17 @@ async def button_handler(
                 await client_pool.stop_owner_engine(user_id)
                 user_sessions.disconnect_user(user_id)
 
+                # UX-NAV-01 92.3: after disconnect the UI automatically
+                # returns to the unconnected state - the connected
+                # menu is replaced by the unconnected one and no
+                # connected-only screens stay tracked.
+                nav_state.clear_screens(user_id)
+                CURRENT_PROJECT.pop(user_id, None)
+
                 await query.message.reply_text(
                     "🔌 Disconnected. Your Telegram session was deleted. "
-                    "Send /start to connect again.",
-                    reply_markup=pre_login_menu
+                    "Send /start or tap Connect Account to connect again.",
+                    reply_markup=menu_unconnected_keyboard()
                 )
 
                 return
@@ -3369,6 +4375,40 @@ async def button_handler(
                 except Exception:
                     pass
 
+                return
+
+            if sub_action == "language":
+                try:
+                    await query.edit_message_text(
+                        "🌐 Language\n\nChoose your language:",
+                        reply_markup=LANGUAGE_KEYBOARD,
+                    )
+                except Exception:
+                    await query.message.reply_text("🌐 Language", reply_markup=LANGUAGE_KEYBOARD)
+                return
+
+            if sub_action == "systatus":
+                total = count_projects(user_id)
+                running = sum(1 for p in get_projects(user_id) if p["status"])
+                engine_state = "🟢 Online" if is_running() else "🔴 Offline"
+                maintenance = context.bot_data.get("maintenance_mode", False)
+                text = (
+                    "📊 System Status\n\n"
+                    f"📁 Tasks: {total}\n"
+                    f"▶ Running: {running}\n"
+                    f"⏹ Stopped: {total - running}\n\n"
+                    f"🚀 Forward Engine: {engine_state}\n"
+                    f"🔧 Maintenance Mode: {'On' if maintenance else 'Off'}\n"
+                    "📡 Mode: Native Forward"
+                )
+                markup = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("⬅ Settings", callback_data="nav:settings"),
+                        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                    ]
+                ])
+                await nav_state.place(query.message, user_id, "settings_systatus", text,
+                                      reply_markup=markup, edit=True)
                 return
 
             await query.message.reply_text("⚠ Unknown Settings Action")
@@ -3818,20 +4858,20 @@ async def button_handler(
             project = _get_owned_project(project_id, user_id)
 
             if project is None:
-                await query.message.reply_text("❌ Project Not Found")
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
                 return
 
             CURRENT_PROJECT[user_id] = project_id
             rules = formatting_service.get_rules(project_id)
 
-            await query.message.reply_text(
-                f"📝 Formatting\n\n📂 {project['name']}\n\n"
+            text = (
+                f"📝 Formatting — {project['name']}\n\n"
                 "Applies in Telegram Copy mode and to Instagram captions. "
-                "Native Telegram Forward mode can't have its content edited, "
-                "so formatting never applies there.",
-                reply_markup=formatting_keyboard(project_id, rules)
+                "Native Telegram Forward mode can't have its content "
+                "edited, so formatting never applies there."
             )
-
+            await nav_state.place(query.message, user_id, f"formatting:{project_id}",
+                                  text, reply_markup=formatting_keyboard(project_id, rules), edit=True)
             return
 
         if action == "fmtfield":
@@ -4026,12 +5066,12 @@ async def button_handler(
             project = _get_owned_project(project_id, user_id)
 
             if project is None:
-                await query.message.reply_text("❌ Project Not Found")
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
                 return
 
             stats = stats_service.get_stats(project_id)
 
-            await query.message.reply_text(
+            text = (
                 f"📊 Stats - {project['name']}\n\n"
                 f"✅ Forwarded: {stats['forwarded']}\n"
                 f"❌ Failed: {stats['failed']}\n"
@@ -4039,7 +5079,14 @@ async def button_handler(
                 f"🧹 Filtered Out: {stats['filtered']}\n"
                 f"🕐 Last Forward: {stats['last_forward_at'] or '-'}"
             )
-
+            markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),
+                    InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                ]
+            ])
+            await nav_state.place(query.message, user_id, f"task_stats:{project_id}", text,
+                                  reply_markup=markup, edit=True)
             return
 
         # ======================================
@@ -4052,14 +5099,20 @@ async def button_handler(
             project = _get_owned_project(project_id, user_id)
 
             if project is None:
-                await query.message.reply_text("❌ Project Not Found")
+                await query.answer("⚠ This task no longer exists.", show_alert=True)
                 return
 
             logs = log_service.get_logs(project_id, limit=15)
+            markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),
+                    InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                ]
+            ])
 
             if not logs:
-
-                await query.message.reply_text("📜 No logs yet for this project.")
+                await nav_state.place(query.message, user_id, f"task_logs:{project_id}",
+                                      "📜 No logs yet for this project.", reply_markup=markup, edit=True)
                 return
 
             level_icon = {"forward": "✅", "error": "❌", "retry": "🔁"}
@@ -4069,10 +5122,9 @@ async def button_handler(
                 for row in logs
             ]
 
-            await query.message.reply_text(
-                "📜 Recent Logs\n\n" + "\n".join(lines)
-            )
-
+            await nav_state.place(query.message, user_id, f"task_logs:{project_id}",
+                                  "📜 Recent Logs\n\n" + "\n".join(lines),
+                                  reply_markup=markup, edit=True)
             return
 
         # ======================================
@@ -4123,6 +5175,48 @@ async def button_handler(
 
                 return
 
+            if sub_action == "payments":
+
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT pr.*, u.username, u.first_name FROM payment_requests pr "
+                    "LEFT JOIN users u ON u.telegram_id = pr.user_id "
+                    "WHERE pr.status = 'SUBMITTED' ORDER BY pr.id ASC LIMIT 10"
+                )
+                rows = cur.fetchall()
+                conn.close()
+
+                if not rows:
+                    try:
+                        await query.edit_message_text("✅ No submitted payments waiting for review.",
+                                                      reply_markup=admin_keyboard)
+                    except Exception:
+                        await query.message.reply_text("✅ No submitted payments waiting for review.",
+                                                       reply_markup=admin_keyboard)
+                    return
+
+                lines = [f"💳 Payments Awaiting Review ({len(rows)})", ""]
+                buttons = []
+                for r in rows:
+                    name = r["first_name"] or ""
+                    uname = f"@{r['username']}" if r["username"] else "no username"
+                    lines.append(f"#{r['id']} · {name} {uname} (ID {r['user_id']})")
+                    lines.append(f"   {r['plan']} × {r['months']}mo — ₹{r['amount_inr']:.0f} via {r['method']}")
+                    buttons.append([
+                        InlineKeyboardButton(f"✅ #{r['id']}", callback_data=f"upgrade:approve:{r['id']}"),
+                        InlineKeyboardButton(f"❌ #{r['id']}", callback_data=f"upgrade:reject:{r['id']}"),
+                    ])
+                buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin:refresh")])
+
+                try:
+                    await query.edit_message_text("\n".join(lines),
+                                                  reply_markup=InlineKeyboardMarkup(buttons))
+                except Exception:
+                    await query.message.reply_text("\n".join(lines),
+                                                   reply_markup=InlineKeyboardMarkup(buttons))
+                return
+
             await query.message.reply_text("⚠ Unknown Admin Action")
             return
 
@@ -4130,22 +5224,22 @@ async def button_handler(
         # UNKNOWN CALLBACK
         # ======================================
 
-        await query.message.reply_text(
-            "⚠ Unknown Action"
-        )
+        await _reply_stale_callback(query, "⚠ Unknown Action")
 
     except (IndexError, ValueError):
 
         logger.warning("Malformed callback data received: %s", data)
 
-        await query.message.reply_text(
-            "⚠ This button is no longer valid. Please refresh with 📁 My Projects."
+        await _reply_stale_callback(
+            query,
+            "⚠ This button is no longer valid. Please refresh with 📁 Projects."
         )
 
     except Exception as e:
 
         logger.exception("Unhandled error in button_handler: %s", e)
 
-        await query.message.reply_text(
+        await _reply_stale_callback(
+            query,
             "⚠ Something went wrong while processing that action. Please try again."
         )
