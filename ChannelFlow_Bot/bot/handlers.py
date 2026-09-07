@@ -568,6 +568,132 @@ def _destination_card_text(destination):
     )
 
 
+def _endpoint_list_line(idx, item):
+    """One numbered line inside the consolidated source/destination
+    list (UX-NAV-05). sqlite3.Row has no .get - use _row_get."""
+    icon = "🟢" if item["enabled"] else "🔴"
+    username = _row_get(item, "username")
+    name = _row_get(item, "title") or username or item["chat_id"]
+    uname = f" (@{username})" if username else ""
+    return f"{idx}. {icon} {name}{uname}"
+
+
+def _sources_list_payload(project, sources, notice=None):
+    """(text, markup) for the consolidated 📥 Sources screen.
+
+    UX-NAV-05: one tracked screen per list (rows drill into a single
+    source's card) instead of a stack of per-source messages; the empty
+    state is a first-use screen with a guide chip (UX-NAV-06) instead
+    of a bare error.
+    """
+    header = f"📥 Sources — {project['name']}"
+    if notice:
+        header = f"{notice}\n\n{header}"
+
+    if not sources:
+        text = (
+            f"{header}\n\n"
+            "No sources yet.\n\n"
+            "💡 Sources are the channels or groups your task forwards "
+            "FROM. Tap ➕ Add Source and send the @username, then add a "
+            "destination and press ▶ Start."
+        )
+        rows = [
+            [InlineKeyboardButton("➕ Add Source", callback_data=f"source:{project['id']}")],
+            [InlineKeyboardButton("💡 How It Works", callback_data="acct:guide")],
+            [
+                InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project['id']}"),
+                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            ],
+        ]
+        return text, InlineKeyboardMarkup(rows)
+
+    lines = [header, ""]
+    lines += [_endpoint_list_line(i, src) for i, src in enumerate(sources, start=1)]
+    rows = []
+    for i, src in enumerate(sources, start=1):
+        icon = "🟢" if src["enabled"] else "🔴"
+        label = f"{i}. {icon} {str(src['title'] or src['username'] or src['chat_id'])[:28]}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sourceitem:{src['id']}:{project['id']}")])
+    rows.append([InlineKeyboardButton("➕ Add Source", callback_data=f"source:{project['id']}")])
+    rows.append([
+        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project['id']}"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _destinations_list_payload(project, destinations, notice=None):
+    """(text, markup) for the consolidated 📤 Destinations screen
+    (UX-NAV-05/06; mirrors _sources_list_payload)."""
+    header = f"📤 Destinations — {project['name']}"
+    if notice:
+        header = f"{notice}\n\n{header}"
+
+    if not destinations:
+        text = (
+            f"{header}\n\n"
+            "No destinations yet.\n\n"
+            "💡 Destinations are where your task forwards TO. Tap ➕ Add "
+            "Destination and send the @username of the channel or group "
+            "that should receive the copies."
+        )
+        rows = [
+            [InlineKeyboardButton("➕ Add Destination", callback_data=f"destination:{project['id']}")],
+            [InlineKeyboardButton("💡 How It Works", callback_data="acct:guide")],
+            [
+                InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project['id']}"),
+                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            ],
+        ]
+        return text, InlineKeyboardMarkup(rows)
+
+    lines = [header, ""]
+    lines += [_endpoint_list_line(i, dst) for i, dst in enumerate(destinations, start=1)]
+    rows = []
+    for i, dst in enumerate(destinations, start=1):
+        icon = "🟢" if dst["enabled"] else "🔴"
+        label = f"{i}. {icon} {str(dst['title'] or dst['username'] or dst['chat_id'])[:28]}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"destitem:{dst['id']}:{project['id']}")])
+    rows.append([InlineKeyboardButton("➕ Add Destination", callback_data=f"destination:{project['id']}")])
+    rows.append([
+        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project['id']}"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _show_sources_screen(message, project, user_id, edit=True, notice=None):
+    """Render the consolidated sources list through nav_state (single
+    tracked screen; repeated navigation replaces the previous one)."""
+    sources = get_sources(project["id"])
+    text, markup = _sources_list_payload(project, sources, notice=notice)
+    return await nav_state.place(
+        message, user_id, f"sources:{project['id']}", text,
+        reply_markup=markup, edit=edit, data={"project_id": project["id"]},
+    )
+
+
+async def _show_destinations_screen(message, project, user_id, edit=True, notice=None):
+    destinations = get_destinations(project["id"])
+    text, markup = _destinations_list_payload(project, destinations, notice=notice)
+    return await nav_state.place(
+        message, user_id, f"destinations:{project['id']}", text,
+        reply_markup=markup, edit=edit, data={"project_id": project["id"]},
+    )
+
+
+def _setup_hint_line(project_id):
+    """First-use getting-started hint for a task that has neither a
+    source nor a destination yet (UX-NAV-06)."""
+    if count_sources(project_id) == 0 and count_destinations(project_id) == 0:
+        return (
+            "\n💡 Getting started: 📥 add a source, 📤 add a destination, "
+            "then press ▶ Start. See the 📖 Guide for a walkthrough."
+        )
+    return ""
+
+
 async def _start_connect_flow(message, user_id):
     """Shared by the 🚀 Connect Now reply-keyboard button and the
     inline account-card button (acct:connect) - both need the exact
@@ -1980,6 +2106,8 @@ async def _show_task_detail(message, project_id, user_id, edit=False, notice=Non
 
     body = _task_summary_text(project)
     text = f"{notice}\n\n{body}" if notice else body
+    # UX-NAV-06: first-use hint while the task is completely unset up.
+    text += _setup_hint_line(project["id"])
     running = bool(project["status"])
     platform_type = project["platform_type"] if "platform_type" in project.keys() else "telegram"
     markup = task_detail_keyboard(project_id, running=running, platform_type=platform_type)
@@ -2233,6 +2361,11 @@ async def _show_rewards(message, context, user_id, edit=False):
         f"Total invited: {stats['total_invited']}\n"
         f"Rewarded so far: {stats['active_referrals']}"
     )
+    if stats["total_invited"] == 0:
+        text += (
+            "\n\n💡 Share your link with friends who forward channels - "
+            "you earn extra PRO days every time one of them upgrades."
+        )
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Share Link", url=link)],
         [
@@ -3135,7 +3268,12 @@ async def _render_tickets_list(message, user_id, edit=True):
     tickets = support_service.list_user_tickets(user_id, limit=10)
 
     if not tickets:
-        text = "🎫 My Support Tickets\n\nNo tickets yet."
+        text = (
+            "🎫 My Support Tickets\n\nNo tickets yet.\n\n"
+            "💡 Something not working? Open a ticket for billing, "
+            "forwarding, or connection help - replies land right here "
+            "in the chat."
+        )
         rows = [[InlineKeyboardButton("➕ New Ticket", callback_data="support:new")]]
     else:
         text_lines = ["🎫 My Support Tickets", ""]
@@ -4562,30 +4700,39 @@ async def button_handler(
                 await query.message.reply_text("❌ Project Not Found")
                 return
 
-            sources = get_sources(project_id)
+            # UX-NAV-05: one consolidated tracked screen (rows drill
+            # into a single source card) instead of a stack of
+            # per-source messages.
+            await _show_sources_screen(query.message, project, user_id, edit=True)
+            return
 
-            if not sources:
+        # ======================================
+        # SOURCE ITEM DRILL-DOWN (from the list row)
+        # ======================================
 
-                await query.message.reply_text(
-                    "❌ No Sources Added\n\n"
-                    "Tap ➕ Source on the task dashboard to add one.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),
-                        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
-                    ]]),
-                )
+        if action == "sourceitem":
 
+            source_id = int(parts[1])
+            project_id = int(parts[2])
+            source, _project = _get_owned_source(source_id, user_id)
+
+            if source is None:
+                project = _get_owned_project(project_id, user_id)
+                if project is not None:
+                    await _show_sources_screen(
+                        query.message, project, user_id, edit=True,
+                        notice="⚠️ That source no longer exists.")
+                else:
+                    await query.message.reply_text("❌ Project Not Found")
                 return
 
-            for source in sources:
-
-                await query.message.reply_text(
-                    _source_card_text(source),
-                    reply_markup=source_item_keyboard(
-                        source["id"], project_id, bool(source["enabled"])
-                    )
-                )
-
+            await nav_state.place(
+                query.message, user_id, f"source:{source_id}",
+                _source_card_text(source),
+                reply_markup=source_item_keyboard(
+                    source_id, project_id, bool(source["enabled"])),
+                edit=True, data={"project_id": project_id, "source_id": source_id},
+            )
             return
 
         # ======================================
@@ -4601,30 +4748,37 @@ async def button_handler(
                 await query.message.reply_text("❌ Project Not Found")
                 return
 
-            destinations = get_destinations(project_id)
+            await _show_destinations_screen(query.message, project, user_id, edit=True)
+            return
 
-            if not destinations:
+        # ======================================
+        # DESTINATION ITEM DRILL-DOWN (from the list row)
+        # ======================================
 
-                await query.message.reply_text(
-                    "❌ No Destinations Added\n\n"
-                    "Tap ➕ Destination on the task dashboard to add one.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),
-                        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
-                    ]]),
-                )
+        if action == "destitem":
 
+            destination_id = int(parts[1])
+            project_id = int(parts[2])
+            destination, _project = _get_owned_destination(destination_id, user_id)
+
+            if destination is None:
+                project = _get_owned_project(project_id, user_id)
+                if project is not None:
+                    await _show_destinations_screen(
+                        query.message, project, user_id, edit=True,
+                        notice="⚠️ That destination no longer exists.")
+                else:
+                    await query.message.reply_text("❌ Project Not Found")
                 return
 
-            for destination in destinations:
-
-                await query.message.reply_text(
-                    _destination_card_text(destination),
-                    reply_markup=destination_item_keyboard(
-                        destination["id"], project_id, bool(destination["enabled"])
-                    )
-                )
-
+            await nav_state.place(
+                query.message, user_id, f"destination:{destination_id}",
+                _destination_card_text(destination),
+                reply_markup=destination_item_keyboard(
+                    destination_id, project_id, bool(destination["enabled"])),
+                edit=True,
+                data={"project_id": project_id, "destination_id": destination_id},
+            )
             return
 
         # ======================================
@@ -4704,16 +4858,12 @@ async def button_handler(
             delete_source(source_id)
             await force_refresh_routes()
 
-            text = "✅ Source Removed\n\n" f"📂 {source['title'] or source['chat_id']}"
-            markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅ Sources", callback_data=f"listsource:{project['id']}"),
-                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
-            ]])
-            try:
-                await query.edit_message_text(text, reply_markup=markup,
-                                              disable_web_page_preview=True)
-            except Exception:
-                await query.message.reply_text(text, reply_markup=markup)
+            # UX-NAV-05: the confirm screen becomes the refreshed list
+            # with a removal notice (same pattern as task delete).
+            removed = source["title"] or source["username"] or source["chat_id"]
+            await _show_sources_screen(
+                query.message, project, user_id, edit=True,
+                notice=f"✅ Source removed: {removed}")
 
             return
 
@@ -4735,16 +4885,10 @@ async def button_handler(
             delete_destination(destination_id)
             await force_refresh_routes()
 
-            text = "✅ Destination Removed\n\n" f"📂 {destination['title'] or destination['chat_id']}"
-            markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅ Destinations", callback_data=f"listdestination:{project['id']}"),
-                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
-            ]])
-            try:
-                await query.edit_message_text(text, reply_markup=markup,
-                                              disable_web_page_preview=True)
-            except Exception:
-                await query.message.reply_text(text, reply_markup=markup)
+            removed = destination["title"] or destination["username"] or destination["chat_id"]
+            await _show_destinations_screen(
+                query.message, project, user_id, edit=True,
+                notice=f"✅ Destination removed: {removed}")
 
             return
 
@@ -4762,16 +4906,28 @@ async def button_handler(
                 await query.message.reply_text("❌ Destination Not Found")
                 return
 
-            await query.message.reply_text("🧪 Sending a real test message...")
-
+            # UX-NAV-05: one progress message that becomes the result
+            # card (no orphan "sending..." text left behind).
+            progress = await query.message.reply_text("🧪 Sending a real test message…")
             ok, detail = await send_test_message(destination["chat_id"], project["name"])
 
             label = destination["title"] or destination["username"] or destination["chat_id"]
-
             if ok:
-                await query.message.reply_text(f"✅ Test Passed\n\n📤 {label} - message delivered.")
+                text = f"✅ Test Passed\n\n📤 {label}\nMessage delivered."
             else:
-                await query.message.reply_text(f"❌ Test Failed\n\n📤 {label}\n\n{detail}")
+                text = f"❌ Test Failed\n\n📤 {label}\n\n{detail}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅ Destinations", callback_data=f"listdestination:{project['id']}"),
+                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            ]])
+            try:
+                await progress.edit_text(text, reply_markup=markup,
+                                         disable_web_page_preview=True)
+            except Exception:
+                try:
+                    await query.message.reply_text(text, reply_markup=markup)
+                except Exception:
+                    pass
 
             return
 
@@ -4797,8 +4953,10 @@ async def button_handler(
                 )
                 return
 
-            await query.message.reply_text(
-                f"🧪 Testing {len(destinations)} destination(s)..."
+            # UX-NAV-05: one progress message edited into the results
+            # card (progress -> result, no trailing duplicates).
+            progress = await query.message.reply_text(
+                f"🧪 Testing {len(destinations)} destination(s)…"
             )
 
             lines = []
@@ -4812,9 +4970,19 @@ async def button_handler(
                     f"✅ {label}" if ok else f"❌ {label} - {detail}"
                 )
 
-            await query.message.reply_text(
-                "🧪 Test Results\n\n" + "\n".join(lines)
-            )
+            result = "🧪 Test Results\n\n" + "\n".join(lines)
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project['id']}"),
+                InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            ]])
+            try:
+                await progress.edit_text(result, reply_markup=markup,
+                                         disable_web_page_preview=True)
+            except Exception:
+                try:
+                    await query.message.reply_text(result, reply_markup=markup)
+                except Exception:
+                    pass
 
             return
 
@@ -5341,9 +5509,9 @@ async def button_handler(
             WAITING_WHITELIST[user_id] = True
 
             await query.message.reply_text(
-                "✅ Send Whitelist Keywords\n\n"
-                "Comma-separated. Only messages containing at least one "
-                "will be forwarded. Send `-` to clear."
+                "📝 Whitelist Keywords\n\n"
+                "Send comma-separated keywords - only messages containing "
+                "at least one will be forwarded. Send `-` to clear."
             )
 
             return
@@ -5362,9 +5530,9 @@ async def button_handler(
             WAITING_BLACKLIST[user_id] = True
 
             await query.message.reply_text(
-                "🚫 Send Blacklist Keywords\n\n"
-                "Comma-separated. Messages containing any of these will "
-                "be skipped. Send `-` to clear."
+                "📝 Blacklist Keywords\n\n"
+                "Send comma-separated keywords - messages containing any "
+                "of these will be skipped. Send `-` to clear."
             )
 
             return
@@ -5684,6 +5852,12 @@ async def button_handler(
                 f"🧹 Filtered Out: {stats['filtered']}\n"
                 f"🕐 Last Forward: {stats['last_forward_at'] or '-'}"
             )
+            if not any((stats["forwarded"], stats["failed"],
+                        stats["retried"], stats["filtered"])):
+                text += (
+                    "\n\n💡 No activity yet - messages forwarded by this "
+                    "task will appear here in real time."
+                )
             markup = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("⬅ Back to Task", callback_data=f"projcard:{project_id}"),

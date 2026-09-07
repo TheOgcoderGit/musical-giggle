@@ -903,7 +903,7 @@ def stars_confirm_keyboard(plan, months):
 
 
 # ---------------------------------------------------------------------------
-# UNREFERENCED LEGACY / REFERENCE-BOT KEYBOARD SECTIONS
+# UNUSED LEGACY / REFERENCE-BOT KEYBOARD SECTIONS
 # ---------------------------------------------------------------------------
 # Everything below until the ADMIN KEYBOARD section was carried over
 # from the reference "Prompt 3" bot. NO live handler imports or renders

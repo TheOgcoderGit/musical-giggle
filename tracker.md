@@ -7,9 +7,9 @@
   - Upstream `main` contains only: `ChannelFlow_AI_Master_PRD.md`, `ChannelFlow_Bot.zip` (base, 299,994 bytes), `README.md`
 - Base ZIP: `ChannelFlow_Bot.zip` in repo root (the 2026-09-05 upload; the only base provided — no FIXED_v4 or older duplicate was used)
 - PRD: `ChannelFlow_AI_Master_PRD.md` (3452 lines, now extended to §94 with UX-NAV-01/02/03–06)
-- Current implementation batch: **Batch 4** (in progress → completed by this checkpoint)
-- Last completed batch: Batch 1/2/3 (see Batch History) and **Batch 4 = Extra Forward Credits + package store + payment history hub + UX-NAV-03/04 + bug (d)/(f)** (this checkpoint)
-- Last tested batch: Batch 4 (tests executed below; results in Batch History)
+- Current implementation batch: **Batch 5** (in progress → completed by this checkpoint)
+- Last completed batch: Batch 1–4 (see Batch History) and **Batch 5 = UX-NAV-05 consistent states + UX-NAV-06 first-use hints** (this checkpoint)
+- Last tested batch: Batch 5 (tests executed below; results in Batch History)
 - Next starting point: next batch after product owner go-ahead (candidates in Resume Point) — see Resume Point
 
 ## Status Legend
@@ -128,11 +128,93 @@
 | PRD §79 | docs match reality | PARTIAL | README.md (repo) | — | full rewrite TODO (Batch final) |
 | UX-NAV-01 (§92) | Unified Onboarding & Navigation UX | Y (users.language_chosen) | Y (i18n_service keys/flag) | Y (handlers/menu) | Y (reply menus + hub screens) | Pending live-Telegram | Y (unit/sim: 24 new) | VERIFIED (mock/simulation) |
 | UX-NAV-02 (§93) | Task-first navigation & message lifecycle | — | Y (nav_state module) | Y (nav:/projcard:/editproj:/deleteconfirm:/… routes) | Y (task list/detail/edit/confirm) | Pending live-Telegram | Y (unit/sim) | VERIFIED (mock/simulation) |
-| UX-NAV-03..06 (§94) | Discovered UX backlog | PARTIAL | — | — | UX-NAV-03 (task-list pagination + search) and UX-NAV-04 (plan-locked CTA screens) implemented in Batch 4 (2026-09-07); UX-NAV-05/06 remain backlog |
+| UX-NAV-03..06 (§94) | Discovered UX backlog | COMPLETE | — | — | UX-NAV-03/04 in Batch 4 (2026-09-07); UX-NAV-05 (consistent progress/success/error/empty states) + UX-NAV-06 (first-use hints + guide chips) in Batch 5 (2026-09-07) |
 
 Batch 4 update rows (2026-09-07):\n\n| ID | Requirement | Status | Files | Test | Notes |\n|---|---|---|---|---|---|\n| PRD §23 + memo | Extra Forward Credits: prepaid unit ledger, atomic consume, admin grant/revoke with reason (23.3), consumption point = forwarder when `reserve_daily_forward` returns False (daily allowance first), one unit per message, release/rollback refund | COMPLETE | services/extra_credits_service.py, core/forwarder.py, database/db.py | tests/test_batch4.py (F1) | ledger `reference` UNIQUE per event family → replay/double-approve/redelivery proof; refund of consumed reference only |\n| PRD §26 + memo | Extra-credit package store: `credit_packages` (3 independent price books INR/USD/Stars, 0 = not configured → method hidden), purchase via Stars (instant XTR invoice) / UPI / crypto, all through one `payment_requests` row (`purpose='extra_credit'`, package_id + extra_forwards snapshot), activation only behind the existing flip-to-final guards | COMPLETE | services/extra_credits_service.py, services/payment_service.py, services/stars_service.py, bot/handlers.py | tests/test_batch4.py (F2) | `xtr:pkg:` payload namespace; grant reference `purchase:payment_request:<id>`; /creditsadjust admin command |\n| PRD §24 + memo | Payment history hub (user + admin) | COMPLETE | bot/handlers.py | tests/test_batch4.py (F3) | latest-10 user screen (own rows only, all methods/purposes); admin review queue + full history reuse one label/status formatter |\n| UX-NAV-03 (§94) | Task-list pagination (8/page) + search (name substring) | COMPLETE | bot/handlers.py, bot/keyboards.py, bot/states.py | tests/test_batch4.py (F4) | per-user `_TASK_PAGE`/`_TASK_TERM`; callbacks `tasks:page/search/clear`; delete-refresh page clamp; no-match/empty states keep affordances |\n| UX-NAV-04 (§94) | Plan-locked gates render Upgrade-CTA screen | COMPLETE | bot/handlers.py | tests/test_batch4.py (F5) | newproj / add-source / add-destination (tap + text paths) → locked screen (reason + ⬆️ Upgrade Plan + Home); under-limit users flow unchanged |\n| bug (d) | `whatsapp_pairing_codes` sample-seed block removed | COMPLETE | database/db.py | tests/test_batch4.py | table created empty even with users present; codes only via the pairing flow |\n| bug (f) | lazy `core.client`: imports never construct Telethon client / open `ChannelFlow.session` | COMPLETE | core/client.py | tests/test_batch4.py | proxy + deferred `@client.on(...)` replay queue; `ensure_started` builds real client on first use |\n\n\\* VERIFIED = verified at the level possible without live Telegram credentials (unit/integration/DB/runtime repro). Live-account E2E remains the documented limitation.
 
 ## Batch History
+
+### Batch 5 — UX-NAV-05 consistent progress/success/error states + UX-NAV-06 first-use hints (2026-09-07)
+
+Next scheduled §94 backlog items (UX-NAV-03/04 shipped in Batch 4),
+approved under the standing product-owner memo; implemented in order,
+not silently.
+
+Features implemented:
+
+1. **UX-NAV-05 — one source/destination screen instead of a card
+   stack** (`listsource` / `listdestination`): the flows that used to
+   `reply_text` one message per source/destination (a stack of
+   untracked bot messages, each with its own action keyboard) now
+   render ONE tracked screen through `nav_state.place`: numbered
+   index rows (🟢/🔴 status, @username), ➕ Add row, Back-to-Task +
+   Home footer. Empty lists are first-use screens ("No sources yet" +
+   what a source is and what to do) instead of a bare ❌ error.
+2. **UX-NAV-05 — item drill-down wired**: new `sourceitem:` /
+   `destitem:` callbacks (the pre-existing row buttons in the list
+   builders finally have handlers) open the item card in place with
+   its action keyboard; toggle re-renders the card, Back returns to
+   the consolidated list. Ownership checks + "no longer exists"
+   refresh-with-notice on both.
+3. **UX-NAV-05 — delete/toggle result refresh**: `deletesource` /
+   `deletedestination` no longer leave an isolated "✅ Removed" text;
+   the confirm screen becomes the refreshed list with a
+   "✅ Source/Destination removed: <name>" notice (the task-delete
+   refresh pattern), ending on the empty-state screen for the last
+   item.
+4. **UX-NAV-05 — progress→result messages**: `testdestination` and
+   `testproject` send ONE "🧪 …" progress message that is edited into
+   the final result card (with Back/Home navigation) — no orphan
+   progress text or fragmented results.
+5. **UX-NAV-05 — prompt copy**: whitelist/blacklist data-entry
+   prompts no longer wear a ✅/🚫 "Send …" success framing; they use
+   the same 📝 prompt style as every other data-entry flow.
+6. **UX-NAV-06 — first-use hints**: an unconfigured task card gets a
+   "💡 Getting started: 📥 add a source, 📤 add a destination, then
+   ▶ Start" hint (auto-hidden the moment anything is configured);
+   empty source/destination screens carry a 💡 explainer + a
+   "💡 How It Works" guide chip; empty ticket lists, zero-referral
+   rewards, and idle stats cards each gained contextual one-line
+   hints.
+
+Files changed:
+- bot/handlers.py (list payload/render helpers, sourceitem/destitem
+  callbacks, listsource/listdestination/list delete-refresh, test
+  progress→result, prompt glyphs, hint lines)
+- ChannelFlow_AI_Master_PRD.md (§94 backlog status lines now tracked
+  per item, marked ✅ for 03–06 with batch references)
+- tracker.md (this file)
+- tests/test_batch5.py (NEW — 15 tests)
+
+Tests executed (Batch 5):
+- pytest suite: 112 passed (97 Batch-1/2/3/4 + 15 Batch-5 new)
+- standalone regressions: test_final_fix.py / test_db_migration.py /
+  test_db.py / test_import.py / test_search.py ALL PASS
+- compileall across bot/services/database/core/destinations/tests/
+  main.py: PASS
+- new-screen callback audit (test): every prefix emitted by the new
+  list/item/result screens is routed — PASS
+
+Test result: PASS (live-Telegram E2E still BLOCKED - no real
+credentials in sandbox; test destinations/progress flows covered
+offline through the real handlers with monkeypatched sends).
+
+Remaining issues after Batch 5: live Telegram E2E BLOCKED; §94 UX
+backlog is now complete (03–06 all shipped); wallet top-up stays
+UPI/crypto-only (Stars-denominated top-up needs an explicit rate
+decision); inner-screen EN/HI i18n rollout ongoing; bug (e)
+unreferenced reference-bot keyboard sections in keyboards.py (pay:/
+pacct:/wacode:/ai/aff/wm payloads; banner-marked, never rendered) +
+ChannelFlowAI5_monetization duplicate tree still to consolidate; bug
+(c) WhatsApp CDN placeholder URLs pending provider work.
+
+Commit/version identifier: see git log (Batch 5 commit after this tracker update).
+
+ZIP generated: `ChannelFlowAI_Batch05_CHECKPOINT.zip` (repo root; excludes secrets/DBs/caches)
+
+Next batch: candidates = Stars wallet top-up (after a rate-policy
+decision), bug (e) legacy-keyboard consolidation + duplicate-tree
+removal, full EN+HI copy pass, live-E2E credentials run.
 
 ### Batch 4 — Extra Forward Credits + package store + payment-history hub + UX-NAV-03/04 + bugs (d)/(f) (2026-09-07)
 
@@ -471,37 +553,37 @@ Next batch: Batch 2 = UX-NAV-01 (Unified Onboarding & Navigation UX) + UX-NAV-02
 ## Resume Point
 
 ```
-CURRENT BATCH:              Batch 4 — COMPLETE (Extra Forward Credits + package store + payment
-                            history hub + UX-NAV-03/04 + bugs d/f; checkpoint ZIP + commit)
-LAST COMPLETED FEATURE:     F1 Extra Credits ledger + F2 package store (Stars/UPI/crypto purchase)
-                            + F3 payment-history hub + F4 task-list pagination/search + F5 locked
-                            screens; housekeeping (d) pairing-seed removal, (f) lazy core.client
-LAST VERIFIED FEATURE:      All of the above at service + handler + simulation level
-                            (97 pytest tests PASS incl. 26 new; legacy regressions PASS;
-                            import-side-effect gate PASS)
-NEXT FEATURE:               TBD by product owner — documented candidates: UX-NAV-05/06 backlog (§94),
-                            Stars wallet top-up (needs a Stars→INR/USD rate policy decision),
-                            bug (e) legacy-keyboard consolidation, full EN+HI copy pass
+CURRENT BATCH:              Batch 5 — COMPLETE (UX-NAV-05 consistent states + UX-NAV-06 first-use
+                            hints; checkpoint ZIP + commit)
+LAST COMPLETED FEATURE:     Consolidated source/destination screens with drill-down, delete/toggle
+                            refresh + empty first-use screens; progress→result test messages;
+                            getting-started/empty-state hints; §94 backlog 03–06 now all shipped
+LAST VERIFIED FEATURE:      All of the above at handler + simulation level
+                            (112 pytest tests PASS incl. 15 new; legacy regressions PASS)
+NEXT FEATURE:               TBD by product owner — documented candidates: Stars wallet top-up
+                            (needs a Stars→INR/USD rate policy decision), bug (e) legacy-keyboard
+                            consolidation + ChannelFlowAI5_monetization duplicate-tree removal,
+                            full EN+HI copy pass
 KNOWN BUGS:                 [open] (c) media publish for WhatsApp uses placeholder CDN URLs (provider
                             work); (e) keyboards.py unreferenced reference-bot keyboard sections
                             (pay:/pacct:/wacode:/ai/aff/wm payloads, never rendered — banner-marked;
                             consolidation candidate) + ChannelFlowAI5_monetization/ duplicate handler
-                            tree; UX-NAV-05/06 (§94) still backlog
-                            [fixed in Batch 4] (d) whatsapp_pairing_codes sample-seed block removed
-                            (table created empty; codes only via the pairing flow); (f) core.client
-                            lazy construction — imports (core.listener, bot.handlers, tests) never
-                            create a ChannelFlow.session file; deferred @client.on() replay queue
-                            [fixed in Batch 3] (g) Stars purchase backend: send_invoice XTR +
-                            pre_checkout_query + successful_payment implemented; upgrade:PLAN_PRICES
-                            latent AttributeError fixed
-                            [fixed in Batch 2] (b) orphan callbacks on DISPLAYED keyboards (see Batch 2
-                            history)
+                            tree; wallet top-up has no Stars-denominated option (rate-policy TODO)
+                            [fixed in Batch 5] UX-NAV-05/06 (see Batch History); prompt copy for
+                            whitelist/blacklist no longer uses success glyphs; sqlite Row .get crash
+                            avoided in the new list helpers (_row_get)
+                            [fixed in Batch 4] (d) whatsapp_pairing_codes sample-seed block removed;
+                            (f) core.client lazy construction — imports never create a
+                            ChannelFlow.session file
+                            [fixed in Batch 3] (g) Stars purchase backend + upgrade:PLAN_PRICES
+                            latent AttributeError
+                            [fixed in Batch 2] (b) orphan callbacks on DISPLAYED keyboards
                             [fixed in Batch 1] (a) stars_monthly_price column gap in plan_configs
 KNOWN BLOCKERS:             live Telegram account test (no real API_ID/API_HASH/BOT_TOKEN in sandbox);
                             the Stars payment sheet is a Telegram-client step (can only be exercised
                             with a real bot); Meta WhatsApp Cloud API credentials; Oxapay key;
                             OpenRouter key
-NEXT TESTS:                 next-batch test list (candidates above), plus rerun of the 97-test suite +
+NEXT TESTS:                 next-batch test list (candidates above), plus rerun of the 112-test suite +
                             UI-integrity audit after every UI change
 ```
 

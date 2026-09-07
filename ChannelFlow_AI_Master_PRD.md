@@ -3587,14 +3587,26 @@ the product actually work end-to-end.**
 
 # 94. UX-Nav Discovered Improvements (Backlog)
 
-> Items found during navigation audits that are NOT yet implemented.
-> Status of every item below: TODO. They are documented for future
-> batches and must not be implemented silently out of order.
+> Items found during navigation audits. Status is tracked per item
+> below and mirrored in the implementation tracker. Items are
+> implemented in order, one batch at a time, never silently out of
+> order.
 
-- UX-NAV-03: Pagination/search for long task lists.
-- UX-NAV-04: Plan-locked feature states with contextual Upgrade CTA
-  (replace generic "locked" alerts).
-- UX-NAV-05: Consistent loading/progress + success/error state
-  messages across all flows.
-- UX-NAV-06: First-use onboarding hints inside sections (guide chips
-  on empty screens).
+- ✅ UX-NAV-03: Pagination/search for long task lists. — implemented
+  (Batch 4: 8/page pages + 🔍 name search, `tasks:page/search/clear`,
+  delete page-clamp).
+- ✅ UX-NAV-04: Plan-locked feature states with contextual Upgrade CTA
+  (replace generic "locked" alerts). — implemented (Batch 4: locked
+  screen with ⬆️ Upgrade Plan + Home on new-task/source/destination
+  gates, tap and text paths).
+- ✅ UX-NAV-05: Consistent loading/progress + success/error state
+  messages across all flows. — implemented (Batch 5: consolidated
+  source/destination list screens with drill-down rows, empty
+  first-use screens, delete/toggle results refresh the list in place,
+  single progress→result messages for destination tests, prompts no
+  longer wear success glyphs).
+- ✅ UX-NAV-06: First-use onboarding hints inside sections (guide chips
+  on empty screens). — implemented (Batch 5: getting-started hint on
+  unconfigured task cards, guide chip + 💡 copy on empty source/
+  destination screens, hints on empty tickets / zero referrals / idle
+  stats).
