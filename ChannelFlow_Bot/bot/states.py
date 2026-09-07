@@ -8,6 +8,10 @@
 # Waiting for project name
 WAITING_PROJECT_NAME = {}
 
+# Batch 4 (UX-NAV-03): waiting for a search term while the user asked
+# to search their task list (next plain text = the search query).
+WAITING_TASK_SEARCH = {}
+
 # Waiting for source username
 WAITING_SOURCE = {}
 

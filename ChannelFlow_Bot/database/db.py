@@ -305,28 +305,10 @@ def _migrate_existing_schema(cur):
                 UNIQUE(user_id, code)
             )
         """)
-        # Seed with example codes for the first registered user.
-        # In production, codes are generated on-demand via /connect_whatsapp.
-        # Use the first user from the users table; if none exist, skip seeding.
-        import uuid, time
-        conn2 = get_connection()
-        cur2 = conn2.cursor()
-        cur2.execute("SELECT telegram_id FROM users LIMIT 1")
-        user_row = cur2.fetchone()
-        conn2.close()
-        if user_row is None:
-            # No users yet; seeding will happen later when first user registers
-            pass
-        else:
-            owner_id = user_row[0]
-            now = int(time.time())
-            for i, (_, stars_price) in enumerate([(1, 100), (3, 300), (6, 600)]):
-                code = str(uuid.uuid4())
-                expires = now + 24 * 3600  # 24 hours expiry
-                cur.execute(
-                    "INSERT INTO whatsapp_pairing_codes(code, user_id, expires_at, created_at, status) VALUES (?, ?, ?, ?, ?)",
-                    (code, owner_id, expires, now, "pending"),
-                )
+        # Note (Bug d fix, Batch 4): pairing codes are ONLY ever
+        # generated on demand by the pairing flow - no sample/seed
+        # codes are inserted at DB init anymore. The historical seed
+        # inserted throwaway codes for the first registered user.
 
 def _migrate_late_tables(cur):
     """
@@ -402,6 +384,17 @@ def _migrate_late_tables(cur):
     if not _column_exists(cur, "payment_requests", "amount_inr"):
         cur.execute("ALTER TABLE payment_requests ADD COLUMN amount_inr REAL")
         cur.execute("UPDATE payment_requests SET amount_inr = amount_usd * 85 WHERE amount_inr IS NULL")
+
+    # Batch 4 (PRD 23/26): extra-credit package purchases snapshot the
+    # package on the request row. package_id references
+    # credit_packages(id); extra_forwards freezes the unit count so a
+    # later admin package edit never changes what an in-flight/paid
+    # purchase grants (same snapshot discipline as price columns).
+    if not _column_exists(cur, "payment_requests", "package_id"):
+        cur.execute("ALTER TABLE payment_requests ADD COLUMN package_id INTEGER")
+
+    if not _column_exists(cur, "payment_requests", "extra_forwards"):
+        cur.execute("ALTER TABLE payment_requests ADD COLUMN extra_forwards INTEGER")
 
 
 def init_db():
@@ -1331,6 +1324,73 @@ def init_db():
                     "INSERT INTO plan_durations(plan, months, discount_percent, active) VALUES (?, ?, ?, 1)",
                     (plan, months, discount),
                 )
+
+    # ==========================
+    # EXTRA FORWARD CREDITS (PRD section 23)
+    # ==========================
+    # extra_credits holds the running balance per user; every change is
+    # journaled in extra_credit_ledger with a UNIQUE reference so no
+    # purchase/grant/consumption/adjustment/refund can ever apply twice
+    # (idempotency identifier, PRD 23.1). Consumption of one unit per
+    # forwarded message happens only after the daily plan allowance is
+    # exhausted (PRD 23.2 priority, enforced in core/forwarder.py).
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS extra_credits(
+        user_id INTEGER PRIMARY KEY,
+        balance INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(telegram_id) ON DELETE CASCADE
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS extra_credit_ledger(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        delta INTEGER NOT NULL,
+        balance_after INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        reference TEXT UNIQUE,
+        reason TEXT,
+        admin_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(telegram_id) ON DELETE CASCADE
+    )
+    """)
+
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_extra_ledger_user ON extra_credit_ledger(user_id, id DESC)"
+    )
+
+    # Configurable credit packages (PRD 23: exact packages and prices
+    # must be configurable). Defaults are seeded once and are never
+    # overwritten; an admin edits the rows directly. INR and USD books
+    # start at 0 (not configured) so UPI/crypto rows only appear after
+    # the owner sets those prices - Stars prices ship as the defaults.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS credit_packages(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        forwards_amount INTEGER NOT NULL UNIQUE,
+        label TEXT,
+        price_inr REAL NOT NULL DEFAULT 0,
+        price_usd REAL NOT NULL DEFAULT 0,
+        stars_price INTEGER NOT NULL DEFAULT 0,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("SELECT COUNT(*) FROM credit_packages")
+    if cur.fetchone()[0] == 0:
+        for forwards, stars in ((100, 15), (500, 65), (1000, 120),
+                                (5000, 550), (10000, 1000)):
+            cur.execute(
+                "INSERT INTO credit_packages(forwards_amount, label, price_inr, price_usd, stars_price) "
+                "VALUES (?, ?, 0, 0, ?)",
+                (forwards, f"{forwards:,} forwards", stars),
+            )
 
     # Late-table migrations - every table now exists, so columns can be
     # added to any of them (INR backfills etc.)

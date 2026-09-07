@@ -7,9 +7,9 @@
   - Upstream `main` contains only: `ChannelFlow_AI_Master_PRD.md`, `ChannelFlow_Bot.zip` (base, 299,994 bytes), `README.md`
 - Base ZIP: `ChannelFlow_Bot.zip` in repo root (the 2026-09-05 upload; the only base provided — no FIXED_v4 or older duplicate was used)
 - PRD: `ChannelFlow_AI_Master_PRD.md` (3452 lines, now extended to §94 with UX-NAV-01/02/03–06)
-- Current implementation batch: **Batch 3** (in progress → completed by this checkpoint)
-- Last completed batch: Batch 1/2 (see Batch History) and **Batch 3 = Telegram Stars checkout backend** (this checkpoint)
-- Last tested batch: Batch 3 (tests executed below; results in Batch History)
+- Current implementation batch: **Batch 4** (in progress → completed by this checkpoint)
+- Last completed batch: Batch 1/2/3 (see Batch History) and **Batch 4 = Extra Forward Credits + package store + payment history hub + UX-NAV-03/04 + bug (d)/(f)** (this checkpoint)
+- Last tested batch: Batch 4 (tests executed below; results in Batch History)
 - Next starting point: next batch after product owner go-ahead (candidates in Resume Point) — see Resume Point
 
 ## Status Legend
@@ -128,11 +128,163 @@
 | PRD §79 | docs match reality | PARTIAL | README.md (repo) | — | full rewrite TODO (Batch final) |
 | UX-NAV-01 (§92) | Unified Onboarding & Navigation UX | Y (users.language_chosen) | Y (i18n_service keys/flag) | Y (handlers/menu) | Y (reply menus + hub screens) | Pending live-Telegram | Y (unit/sim: 24 new) | VERIFIED (mock/simulation) |
 | UX-NAV-02 (§93) | Task-first navigation & message lifecycle | — | Y (nav_state module) | Y (nav:/projcard:/editproj:/deleteconfirm:/… routes) | Y (task list/detail/edit/confirm) | Pending live-Telegram | Y (unit/sim) | VERIFIED (mock/simulation) |
-| UX-NAV-03..06 (§94) | Discovered UX backlog | TODO | — | — | doc-only backlog, prioritize later (explicitly NOT implemented out of order) |
+| UX-NAV-03..06 (§94) | Discovered UX backlog | PARTIAL | — | — | UX-NAV-03 (task-list pagination + search) and UX-NAV-04 (plan-locked CTA screens) implemented in Batch 4 (2026-09-07); UX-NAV-05/06 remain backlog |
 
-\* VERIFIED = verified at the level possible without live Telegram credentials (unit/integration/DB/runtime repro). Live-account E2E remains the documented limitation.
+Batch 4 update rows (2026-09-07):\n\n| ID | Requirement | Status | Files | Test | Notes |\n|---|---|---|---|---|---|\n| PRD §23 + memo | Extra Forward Credits: prepaid unit ledger, atomic consume, admin grant/revoke with reason (23.3), consumption point = forwarder when `reserve_daily_forward` returns False (daily allowance first), one unit per message, release/rollback refund | COMPLETE | services/extra_credits_service.py, core/forwarder.py, database/db.py | tests/test_batch4.py (F1) | ledger `reference` UNIQUE per event family → replay/double-approve/redelivery proof; refund of consumed reference only |\n| PRD §26 + memo | Extra-credit package store: `credit_packages` (3 independent price books INR/USD/Stars, 0 = not configured → method hidden), purchase via Stars (instant XTR invoice) / UPI / crypto, all through one `payment_requests` row (`purpose='extra_credit'`, package_id + extra_forwards snapshot), activation only behind the existing flip-to-final guards | COMPLETE | services/extra_credits_service.py, services/payment_service.py, services/stars_service.py, bot/handlers.py | tests/test_batch4.py (F2) | `xtr:pkg:` payload namespace; grant reference `purchase:payment_request:<id>`; /creditsadjust admin command |\n| PRD §24 + memo | Payment history hub (user + admin) | COMPLETE | bot/handlers.py | tests/test_batch4.py (F3) | latest-10 user screen (own rows only, all methods/purposes); admin review queue + full history reuse one label/status formatter |\n| UX-NAV-03 (§94) | Task-list pagination (8/page) + search (name substring) | COMPLETE | bot/handlers.py, bot/keyboards.py, bot/states.py | tests/test_batch4.py (F4) | per-user `_TASK_PAGE`/`_TASK_TERM`; callbacks `tasks:page/search/clear`; delete-refresh page clamp; no-match/empty states keep affordances |\n| UX-NAV-04 (§94) | Plan-locked gates render Upgrade-CTA screen | COMPLETE | bot/handlers.py | tests/test_batch4.py (F5) | newproj / add-source / add-destination (tap + text paths) → locked screen (reason + ⬆️ Upgrade Plan + Home); under-limit users flow unchanged |\n| bug (d) | `whatsapp_pairing_codes` sample-seed block removed | COMPLETE | database/db.py | tests/test_batch4.py | table created empty even with users present; codes only via the pairing flow |\n| bug (f) | lazy `core.client`: imports never construct Telethon client / open `ChannelFlow.session` | COMPLETE | core/client.py | tests/test_batch4.py | proxy + deferred `@client.on(...)` replay queue; `ensure_started` builds real client on first use |\n\n\\* VERIFIED = verified at the level possible without live Telegram credentials (unit/integration/DB/runtime repro). Live-account E2E remains the documented limitation.
 
 ## Batch History
+
+### Batch 4 — Extra Forward Credits + package store + payment-history hub + UX-NAV-03/04 + bugs (d)/(f) (2026-09-07)
+
+Approved scope (product-owner memo, 2026-09-07): five features + two
+housekeeping fixes. Batch numbering stays this agent's own sequence;
+PRD §23/§24/§26 and §92–94 (UX-NAV memo rows) anchor the work.
+
+Features implemented:
+
+1. **F1 — Extra Forward Credits ledger (PRD §23)**:
+   - `database/db.py`: `extra_credits` (balance per user) +
+     `extra_credit_ledger` (UNIQUE `reference`, kind/delta/reason/
+     admin_id/created_at) + `credit_packages` DDL in the base schema
+     with once-only seeds when the table is empty (100→⭐15,
+     500→⭐65, 1000→⭐120, 5000→⭐550, 10000→⭐1000; INR/USD default 0
+     = "not configured"); late migrations add
+     `payment_requests.package_id` + `extra_forwards`.
+   - `services/extra_credits_service.py` (NEW, pure service layer):
+     `apply/consume/refund/admin_adjust` are atomic + idempotent —
+     every event carries a UNIQUE `reference`
+     (`purchase:payment_request:<id>` / `fwd:<project>:<chat>:<msg>`
+     / `refund:<consume_ref>` / `adjust:<admin_id>:<hex>`) so webhook
+     replay, double approval, and Telegram redelivery can never
+     double-spend or double-grant; balance never goes below zero;
+     concurrent consumers are serialized by the DB (30-thread test:
+     exactly 5 succeed on 5 credits). `admin_adjust` (PRD §23.3)
+     records reason + admin identity; `/creditsadjust
+     <credit|debit> <id> <amount> [reason]` admin command added and
+     registered in main.py.
+   - `core/forwarder.py` — the mandated consumption point: when
+     `reserve_daily_forward` returns False the message falls back to
+     one extra credit (`fwd:<project_id>:<chat_id>:<msg_id>`), i.e.
+     daily allowance is always used first; a message that ends up not
+     published refunds whichever unit was reserved (daily reserve or
+     `refund:<consume_ref>`); filters drop before any reserve; one
+     unit per message, never per destination.
+
+2. **F2 — Extra-credit package store + purchase (PRD §26)**:
+   - Three independent price books are persisted as columns (INR /
+     USD / Stars — never converted); a 0 price means "not configured"
+     and `available_methods_for()` hides that method (checks the
+     existing `is_upi_configured` / `is_oxapay_configured` guards).
+   - All three methods create one `payment_requests` row with
+     `purpose='extra_credit'` + a `package_id`/`extra_forwards`/
+     price snapshot: Stars via a real XTR invoice in the new
+     `xtr:pkg:` payload namespace; UPI via the pay-to-ID + screenshot
+     review flow; crypto via the Oxapay link flow. Activation happens
+     only behind the existing flip-to-final-status guards —
+     `payment_service` (admin approval / crypto verification) and
+     `stars_service._activate` (Telegram payment success) both route
+     `purpose='extra_credit'` through
+     `extra_credits_service.activate_payment_row`, which grants the
+     ledger once and is idempotent against replay.
+
+3. **F3 — Payment-history hub (PRD §24 / 25.2 / 26)**:
+   - `_send_payment_history` (user): latest 10 of the user's OWN
+     `payment_requests` across every method/purpose, rendered by
+     `_payment_request_line` (plan months / wallet top-up /
+     `⚡ N prepaid forwards` + ⭐/$/₹ amount) + `_payment_status_label`;
+     footer nav = Account / 🛒 Extra Credits / Home.
+   - Plan screen now shows "📈 Today: X / cap forwards" and the live
+     Extra-Credit balance with 🛒 Extra Credits + 📜 History rows;
+     Account card routes `acct:history`.
+   - Admin: review-queue lines use the same legible label and the
+     queue adds a "📜 Full history" (`admin:payhistory`, latest 25,
+     user context + status). Approve/reject notifications branch on
+     purpose ("⚡ N Extra Credits were added" vs "now on <plan>").
+
+4. **F4 — UX-NAV-03: task-list pagination + search**:
+   - `_task_list_payload` slices 8/page (newest first) with per-user
+     `_TASK_PAGE` / `_TASK_TERM` state separate from the WAITING
+     flags, so back-navigation restores context; `tasks:page:N`,
+     `tasks:search`, `tasks:clear` callbacks; page clamping when the
+     last item on a page is deleted (delete-refresh now renders the
+     same payload); `WAITING_TASK_SEARCH` captures the typed term in
+     `menu_handler`; search filters project names, shows
+     `“term” - N match(es)`, and no-match / empty states keep a
+     Clear-search / New-Task escape; `_go_home` and /disconnect clear
+     the browse state; task-list keyboard rows joined the displayed-
+     keyboard audit.
+
+5. **F5 — UX-NAV-04: plan-locked screens with Upgrade CTA**:
+   - `newproj`, add-source and add-destination taps AND the text
+     paths now render a real screen when a plan gate fails —
+     "🔒 Plan limit" + the reason + ⬆️ Upgrade Plan
+     (`acct:upgrade`, the live payment chain) + 🏠 Home — instead of
+     a bare toast with no way forward. Under-limit users flow through
+     unchanged (no regression).
+
+Housekeeping:
+- (d) Removed the seeded `whatsapp_pairing_codes` sample block —
+  the table is created empty even when users exist; codes appear only
+  through the pairing flow.
+- (f) `core.client` is now lazy: module import never constructs the
+  Telethon `TelegramClient` (which opened an empty `ChannelFlow.session`
+  file on every import). A proxy defers construction to first real
+  attribute use, and module-level `@client.on(...)` decorators are
+  queued and replayed onto the real client at construction
+  (registration order preserved) — verified by an import-gate test
+  that imports `core.processing_listener`, `core.listener`, and
+  `bot.handlers` and asserts no session file is created.
+
+Files changed:
+- database/db.py (extra-credits tables + package seeds + payment
+  migrations + pairing-seed removal)
+- services/extra_credits_service.py (NEW)
+- services/payment_service.py (extra_credit activation branches)
+- services/stars_service.py (PAYLOAD_PKG + extra-credit activate)
+- core/forwarder.py (extra-credit consume/release hook)
+- core/client.py (lazy construction + deferred event registration)
+- bot/states.py (WAITING_TASK_SEARCH), bot/keyboards.py (task-list
+  pagination/search rows)
+- bot/handlers.py (task search/pagination, locked screens, credits
+  hub/packages/method screens, payment-history screens + routes,
+  /creditsadjust, purpose-aware receipts/notices)
+- main.py (creditsadjust registration)
+- tests/test_uxnav_batch2.py (audit sets += tasks/credits)
+- tests/test_batch4.py (NEW — 26 tests: F1 ledger
+  atomicity/idempotency/concurrency, F2 packages + activation per
+  method + UI chains, F3 history screens, F4 pagination/search/
+  delete-clamp, F5 locked gates, (d)/(f) housekeeping)
+- tracker.md (this file)
+
+Tests executed (Batch 4):
+- pytest suite: 97 passed (71 Batch-1/2/3 + 26 Batch-4 new)
+- standalone regressions: test_final_fix.py / test_db_migration.py /
+  test_db.py / test_import.py / test_search.py ALL PASS
+- compileall across bot/services/database/core/destinations/tests/
+  main.py: PASS
+- import side-effect gate (fresh env): full chain import creates NO
+  ChannelFlow.session — PASS
+- UI-integrity callback audit (test): PASS with the extended sets
+
+Test result: PASS (live-Telegram E2E still BLOCKED - no real
+credentials in sandbox; Stars sheet + UPI/Oxapay review remain client/
+provider steps, covered offline through the real handlers).
+
+Remaining issues after Batch 4: live Telegram E2E BLOCKED; wallet
+top-up stays UPI/crypto-only (Stars-denominated top-up needs an
+explicit rate decision — unchanged); inner-screen EN/HI i18n rollout
+ongoing; bug (e) unreferenced reference-bot keyboard sections +
+ChannelFlowAI5_monetization duplicate tree still to consolidate;
+UX-NAV-05/06 backlog still open; bug (c) WhatsApp CDN placeholder
+URLs pending provider work.
+
+Commit/version identifier: see git log (Batch 4 commit after this tracker update).
+
+ZIP generated: `ChannelFlowAI_Batch04_CHECKPOINT.zip` (repo root; excludes secrets/DBs/caches)
+
+Next batch: candidates = UX-NAV-05/06 (§94) when scheduled, Stars
+wallet top-up (after a rate-policy decision), bug (e) legacy-keyboard
+consolidation, full-HI copy pass, live-E2E credentials run.
 
 ### Batch 3 — Telegram Stars checkout backend (PRD §26) (2026-09-07)
 
@@ -319,29 +471,29 @@ Next batch: Batch 2 = UX-NAV-01 (Unified Onboarding & Navigation UX) + UX-NAV-02
 ## Resume Point
 
 ```
-CURRENT BATCH:              Batch 3 — COMPLETE (Telegram Stars checkout backend; checkpoint ZIP + commit
-                            pushed; awaiting user go-ahead for the next batch)
-LAST COMPLETED FEATURE:     Telegram Stars plan checkout (PRD §26) - send_invoice XTR chain +
-                            pre_checkout + successful_payment + idempotent snapshot activation
-LAST VERIFIED FEATURE:      Stars checkout verified at service + handler + simulation level
-                            (71 pytest tests PASS incl. 23 new; legacy regressions PASS)
-NEXT FEATURE:               TBD by product owner — documented candidates: UX-NAV-03..06 backlog (§94),
-                            extra-credit packages (backend + Stars purchase), Stars wallet top-up
-                            (needs a Stars→INR/USD rate policy decision), WhatsApp CDN placeholder
-                            URLs, whatsapp_pairing seed cleanup, ChannelFlowAI5 duplicate tree
-                            consolidation, lazy core.client construction, full EN+HI copy pass
+CURRENT BATCH:              Batch 4 — COMPLETE (Extra Forward Credits + package store + payment
+                            history hub + UX-NAV-03/04 + bugs d/f; checkpoint ZIP + commit)
+LAST COMPLETED FEATURE:     F1 Extra Credits ledger + F2 package store (Stars/UPI/crypto purchase)
+                            + F3 payment-history hub + F4 task-list pagination/search + F5 locked
+                            screens; housekeeping (d) pairing-seed removal, (f) lazy core.client
+LAST VERIFIED FEATURE:      All of the above at service + handler + simulation level
+                            (97 pytest tests PASS incl. 26 new; legacy regressions PASS;
+                            import-side-effect gate PASS)
+NEXT FEATURE:               TBD by product owner — documented candidates: UX-NAV-05/06 backlog (§94),
+                            Stars wallet top-up (needs a Stars→INR/USD rate policy decision),
+                            bug (e) legacy-keyboard consolidation, full EN+HI copy pass
 KNOWN BUGS:                 [open] (c) media publish for WhatsApp uses placeholder CDN URLs (provider
-                            work); (d) whatsapp_pairing seed block inserts sample codes for first user at
-                            DB init (cleanup candidate); (e) keyboards.py unreferenced reference-bot
-                            keyboard sections (pay:/pacct:/wacode:/ai/aff/wm payloads, never rendered —
-                            banner-marked; consolidation candidate) + ChannelFlowAI5_monetization/
-                            duplicate handler tree; (f) core.client import side-effect creates empty
-                            ChannelFlow.session file on any import (gitignored; lazy-construction
-                            cleanup candidate)
+                            work); (e) keyboards.py unreferenced reference-bot keyboard sections
+                            (pay:/pacct:/wacode:/ai/aff/wm payloads, never rendered — banner-marked;
+                            consolidation candidate) + ChannelFlowAI5_monetization/ duplicate handler
+                            tree; UX-NAV-05/06 (§94) still backlog
+                            [fixed in Batch 4] (d) whatsapp_pairing_codes sample-seed block removed
+                            (table created empty; codes only via the pairing flow); (f) core.client
+                            lazy construction — imports (core.listener, bot.handlers, tests) never
+                            create a ChannelFlow.session file; deferred @client.on() replay queue
                             [fixed in Batch 3] (g) Stars purchase backend: send_invoice XTR +
                             pre_checkout_query + successful_payment implemented; upgrade:PLAN_PRICES
-                            latent AttributeError fixed (nonexistent constant, every acct:upgrade tap
-                            crashed → stale-callback reply); Stars row live on the upgrade picker
+                            latent AttributeError fixed
                             [fixed in Batch 2] (b) orphan callbacks on DISPLAYED keyboards (see Batch 2
                             history)
                             [fixed in Batch 1] (a) stars_monthly_price column gap in plan_configs
@@ -349,7 +501,7 @@ KNOWN BLOCKERS:             live Telegram account test (no real API_ID/API_HASH/
                             the Stars payment sheet is a Telegram-client step (can only be exercised
                             with a real bot); Meta WhatsApp Cloud API credentials; Oxapay key;
                             OpenRouter key
-NEXT TESTS:                 next-batch test list (candidates above), plus rerun of the 71-test suite +
+NEXT TESTS:                 next-batch test list (candidates above), plus rerun of the 97-test suite +
                             UI-integrity audit after every UI change
 ```
 

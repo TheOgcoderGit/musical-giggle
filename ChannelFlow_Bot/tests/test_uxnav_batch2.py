@@ -474,6 +474,8 @@ HANDLED_PREFIXES = {
     "fmtremoveadd", "fmtremovedel", "fmtclear", "clearfilters",
     "clearfiltersconfirm", "filterkw", "filterdomains", "filtersenders",
     "fmtroot", "stats", "logs", "admin", "promo", "noop",
+    # Batch 4: task-list pagination/search rows + extra-credits hub
+    "tasks", "credits",
 }
 
 # callbacks that must NEVER be produced by displayed keyboards

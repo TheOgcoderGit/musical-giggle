@@ -374,6 +374,11 @@ def approve_crypto_payment(request_id):
             request["amount_inr"],
             reference=f"crypto_topup:{request_id}",
         )
+    elif request["purpose"] == "extra_credit":
+        # Batch 4 (PRD 23): approved package purchase -> prepaid
+        # forwarding units on the user's extra-credits balance.
+        from services import extra_credits_service
+        extra_credits_service.activate_payment_row(request)
     else:
         _activate_plan_purchase(request, actor_label="crypto_verified")
 
@@ -533,6 +538,13 @@ def approve_payment(request_id, admin_id):
 
         from services import wallet_service
         wallet_service.credit(request["user_id"], request["amount_inr"], reference=f"payment_request:{request_id}")
+
+    elif request["purpose"] == "extra_credit":
+
+        # Batch 4 (PRD 23): admin-approved package purchase grants
+        # prepaid forwarding units exactly once (ledger-unique ref).
+        from services import extra_credits_service
+        extra_credits_service.activate_payment_row(request)
 
     else:
 

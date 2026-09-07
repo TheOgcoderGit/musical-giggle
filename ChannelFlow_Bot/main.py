@@ -29,6 +29,7 @@ from bot.handlers import (
     mycode_command,
     unknown_command_handler,
     walletadjust_command,
+    creditsadjust_command,
     menu_handler,
     button_handler,
     pre_checkout_handler,
@@ -152,6 +153,7 @@ app.add_handler(CommandHandler("setduration", setduration_command))
 app.add_handler(CommandHandler("planconfig", planconfig_command))
 app.add_handler(CommandHandler("payments", payments_command))
 app.add_handler(CommandHandler("walletadjust", walletadjust_command))
+app.add_handler(CommandHandler("creditsadjust", creditsadjust_command))
 app.add_handler(CommandHandler("connect", connect_command))
 
 # PRD section 5.2: /mycode is the mandatory OTP command.

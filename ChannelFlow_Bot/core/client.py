@@ -39,14 +39,70 @@ logger = logging.getLogger(__name__)
 # handful of attempts. retry_delay backs off between reconnect attempts.
 # auto_reconnect=True (the default) keeps the socket self-healing after
 # a network blip without the rest of the app noticing.
-client = TelegramClient(
-    SESSION_NAME,
-    API_ID,
-    API_HASH,
-    connection_retries=None,
-    retry_delay=5,
-    auto_reconnect=True,
-)
+#
+# Bug-f fix (Batch 4): construction is LAZY. TelegramClient(...) opens
+# the .session sqlite file at import time, which meant every `import
+# bot.handlers` (tests, tools, anything) silently created an empty
+# ChannelFlow.session file. The module-level `client` is a proxy that
+# only constructs the real client on first attribute use, so imports
+# are side-effect free.
+
+_client_instance = None
+
+# Decorator registrations made through the proxy before the real
+# client exists (e.g. processing_listener's module-level
+# `@client.on(events.NewMessage)`) are queued here and replayed onto
+# the real client the moment it is constructed, so importing modules
+# stays completely side-effect free while registration order is
+# preserved.
+_pending_event_handlers = []
+
+
+def _get_client():
+    global _client_instance
+    if _client_instance is None:
+        _client_instance = TelegramClient(
+            SESSION_NAME,
+            API_ID,
+            API_HASH,
+            connection_retries=None,
+            retry_delay=5,
+            auto_reconnect=True,
+        )
+        for event, callback in _pending_event_handlers:
+            try:
+                _client_instance.on(event)(callback)
+            except Exception:
+                logger.exception("Failed to replay deferred event handler")
+        _pending_event_handlers.clear()
+    return _client_instance
+
+
+class _LazyClientProxy:
+    """Delegates every attribute to the lazily-built TelegramClient.
+
+    `.on(...)` is special-cased so module-level ``@client.on(...)``
+    decorators only touch the real client once it actually exists
+    (bug-f: imports must never construct the client / open the session
+    file)."""
+
+    def on(self, event):
+        def decorator(callback):
+            if _client_instance is not None:
+                _client_instance.on(event)(callback)
+            else:
+                _pending_event_handlers.append((event, callback))
+            return callback
+        return decorator
+
+    def __getattr__(self, name):
+        return getattr(_get_client(), name)
+
+    def __repr__(self):
+        return repr(_get_client())
+
+
+client = _LazyClientProxy()
 
 _start_lock = asyncio.Lock()
 _started = False
@@ -61,17 +117,19 @@ async def ensure_started():
 
     global _started
 
-    if _started and client.is_connected():
-        return client
+    real = _get_client()
+
+    if _started and real.is_connected():
+        return real
 
     async with _start_lock:
 
-        if _started and client.is_connected():
-            return client
+        if _started and real.is_connected():
+            return real
 
-        await client.start()
+        await real.start()
 
-        if not await client.is_user_authorized():
+        if not await real.is_user_authorized():
 
             logger.error(
                 "The Telethon session is not authorized. Run "
@@ -86,7 +144,7 @@ async def ensure_started():
 
         _started = True
 
-        me = await client.get_me()
+        me = await real.get_me()
 
         logger.info(
             "Telethon client authorized as %s (id=%s)",
@@ -94,4 +152,4 @@ async def ensure_started():
             me.id,
         )
 
-    return client
+    return real

@@ -53,9 +53,10 @@ STARS_INVOICE_LIFETIME_MINUTES = 15
 # Telegram's currency token for Stars invoices.
 STARS_CURRENCY = "XTR"
 
-# Payload namespace (distinct from the inline upgrade:* chain so a
+# Payload namespaces (distinct from the inline upgrade:* chain so a
 # stale payload can never collide with a live callback).
-PAYLOAD_PLAN = "xtr:plan:"          # xtr:plan:BEGINNER:1
+PAYLOAD_PLAN = "xtr:plan:"          # xtr:plan:<request_id>  (plan purchase)
+PAYLOAD_PKG = "xtr:pkg:"            # xtr:pkg:<request_id>   (extra-credit package)
 
 # Plans purchasable with Stars (same set as UPI/crypto).
 PURCHASABLE_PLANS = ("BEGINNER", "PRO", "CREATOR")
@@ -195,7 +196,8 @@ def resolve_stars_success(request_id, telegram_user_id, paid_stars):
          amount than quoted - refuse, never partially credit).
 
     When every check passes, atomically flips the row to 'SUCCESS' and
-    activates the plan (shared, idempotent activation logic).
+    activates what was paid for (plan subscription, or extra-credit
+    package for purpose='extra_credit' - shared, idempotent logic).
 
     Returns (row_after, "ok") on success, else (row, reason) where
     reason is one of: not_found / not_stars / not_owner /
@@ -254,9 +256,15 @@ def _flip(request_id, status):
 
 
 def _activate(row):
-    """Grant the paid plan (mirror of payment_service activation; only
-    ever invoked once per row thanks to the guarded SUCCESS flip)."""
+    """Grant what was paid for (mirror of payment_service activation;
+    only ever invoked once per row thanks to the guarded SUCCESS flip).
+    Purpose branches: 'plan' -> activate subscription; 'extra_credit'
+    -> grant the purchased prepaid forwards package (PRD 23)."""
     user_id = row["user_id"]
+    if row["purpose"] == "extra_credit":
+        from services import extra_credits_service
+        extra_credits_service.activate_payment_row(row)
+        return
     plan = row["plan"]
     months = row["months"] or 1
     expiry = (_now() + timedelta(days=30 * months)).isoformat()

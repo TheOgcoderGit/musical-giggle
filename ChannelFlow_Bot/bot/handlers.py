@@ -91,6 +91,7 @@ from services import i18n
 
 from bot.states import (
     WAITING_PROJECT_NAME,
+    WAITING_TASK_SEARCH,
     WAITING_SOURCE,
     WAITING_DESTINATION,
     WAITING_RENAME,
@@ -123,7 +124,7 @@ from database.db import get_connection
 from config import ADMIN_IDS, INSTAGRAM_ACCESS_TOKEN
 
 from services import content_rules_service, formatting_service, plan_service, referral_service, payment_service, pricing_service, wallet_service
-from services import stars_service
+from services import stars_service, extra_credits_service
 from config import UPI_ID, UPI_PAYEE_NAME
 from core import user_sessions, client_pool
 from core import session_crypto
@@ -309,6 +310,7 @@ def _reset_waiting_states(user_id):
     # navigating away always clears them so a stale flag never swallows
     # an unrelated future message.
     WAITING_SUPPORT_AI.pop(user_id, None)
+    WAITING_TASK_SEARCH.pop(user_id, None)
     WAITING_TICKET_SUBJECT.pop(user_id, None)
     WAITING_TICKET_MESSAGE.pop(user_id, None)
     WAITING_TICKET_REPLY.pop(user_id, None)
@@ -328,6 +330,40 @@ def _reply_menu_for(user_id):
     if user_id in ADMIN_IDS or user_sessions.is_connected(user_id):
         return menu_connected_keyboard()
     return menu_unconnected_keyboard()
+
+
+# ==========================================
+# TASK-LIST BROWSING STATE (Batch 4 / UX-NAV-03)
+# ==========================================
+# Per-user pagination + search term for the task list. Deliberately
+# separate from WAITING_* flags: the term survives opening a task and
+# coming back, and is cleared only by an explicit Clear, Home, or
+# disconnect (not by every navigation reset).
+
+_TASK_PAGE_SIZE = 8
+_TASK_PAGE = {}     # user_id -> int page (1-based)
+_TASK_TERM = {}     # user_id -> str search term (None/absent = browse all)
+
+
+def _clear_task_browse(user_id):
+    _TASK_PAGE.pop(user_id, None)
+    _TASK_TERM.pop(user_id, None)
+    WAITING_TASK_SEARCH.pop(user_id, None)
+
+
+def _today_global_usage(user_id) -> int:
+    """Forwards used today across all of the user's projects."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(du.forward_count), 0) AS total FROM daily_usage du "
+        "JOIN projects p ON p.id = du.project_id "
+        "WHERE p.user_id = ? AND du.usage_date = date('now')",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return int(row["total"]) if row else 0
 
 
 # ==========================================
@@ -810,6 +846,7 @@ async def _go_home(message, user, edit=False):
     never cancels flows or touches configuration - it only re-renders
     the appropriate Main Menu state."""
     _reset_waiting_states(user.id)
+    _clear_task_browse(user.id)
     connected = user.id in ADMIN_IDS or user_sessions.is_connected(user.id)
     text = _home_text(user, connected)
     menu = menu_connected_keyboard() if connected else menu_unconnected_keyboard()
@@ -1376,6 +1413,48 @@ async def walletadjust_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ Wallet {result} for user {target}.\nNew balance: ₹{balance:.2f}")
 
 
+async def creditsadjust_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin grant/revoke of Extra Credits with reason + audit record
+    (PRD 23.3). Usage:
+        /creditsadjust credit <telegram_id> <amount> [reason...]
+        /creditsadjust debit <telegram_id> <amount> [reason...]
+    """
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    args = context.args or []
+    if len(args) < 3 or args[0] not in ("credit", "debit"):
+        await update.message.reply_text(
+            "Usage: /creditsadjust <credit|debit> <telegram_id> <amount> [reason]")
+        return
+    if not args[1].isdigit():
+        await update.message.reply_text("❌ telegram_id must be numeric.")
+        return
+    try:
+        target = int(args[1])
+        amount = int(args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Amount must be a whole number.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("❌ Amount must be positive.")
+        return
+    reason = " ".join(args[3:]) or ("admin grant" if args[0] == "credit" else "admin revoke")
+    delta = amount if args[0] == "credit" else -amount
+    if not extra_credits_service.admin_adjust(target, delta, reason, admin_id=user.id):
+        await update.message.reply_text(
+            f"❌ {args[0].title()} failed (not enough balance, or user does "
+            "not exist). Nothing changed.")
+        return
+    balance = extra_credits_service.get_balance(target)
+    await update.message.reply_text(
+        f"✅ {args[0].title()} of {amount} applied to user {target}.\n"
+        f"New balance: ⚡ {balance:,} forwards")
+    logger.info("Extra credits adjusted: admin=%s target=%s delta=%s reason=%r",
+                user.id, target, delta, reason)
+
+
 async def setplan_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -1658,6 +1737,21 @@ async def menu_handler(
         return
 
     # ======================================
+    # TASK SEARCH TERM (Batch 4 / UX-NAV-03)
+    # ======================================
+
+    if user.id in WAITING_TASK_SEARCH:
+        WAITING_TASK_SEARCH.pop(user.id, None)
+        term = text.strip()
+        _TASK_PAGE.pop(user.id, None)
+        if term:
+            _TASK_TERM[user.id] = term
+        else:
+            _TASK_TERM.pop(user.id, None)
+        await _show_task_list(message, user.id, edit=False)
+        return
+
+    # ======================================
     # CREATE PROJECT
     # ======================================
 
@@ -1814,21 +1908,55 @@ def _task_summary_text(project):
     )
 
 
-async def _show_task_list(message, user_id, edit=False):
-    """📁 Projects = the task list FIRST (UX-NAV-02 93.1), with an
-    empty state (Create Your First Task) when there are zero tasks.
-    Rendered through nav_state.place so repeated navigation replaces
-    the previous bot screen message instead of stacking duplicates."""
-    projects = get_projects(user_id)
+def _task_list_payload(user_id):
+    """(text, markup, page_count) for the user's task list honouring
+    the per-user browse state: optional search term + pagination
+    (UX-NAV-03). Pure helper used by both the initial render and the
+    after-delete refresh so both stay consistent."""
+    all_projects = get_projects(user_id)
     allowed, _reason = plan_service.can_create_project(user_id)
 
-    if not projects:
-        text = i18n.t(user_id, "nav.tasks_empty")
-        markup = task_list_keyboard([], can_create=allowed)
+    term = _TASK_TERM.get(user_id)
+    if term:
+        needle = term.lower()
+        projects = [p for p in all_projects if needle in (p["name"] or "").lower()]
     else:
-        text = i18n.t(user_id, "nav.your_tasks")
-        markup = task_list_keyboard(projects, can_create=allowed)
+        projects = all_projects
 
+    total = len(projects)
+    page_count = max(1, -(-total // _TASK_PAGE_SIZE))
+    page = max(1, min(_TASK_PAGE.get(user_id, 1), page_count))
+    start = (page - 1) * _TASK_PAGE_SIZE
+    visible = projects[start:start + _TASK_PAGE_SIZE]
+
+    if term and not total:
+        text = f"🔍 No tasks match “{term}”.\n\nClear the search to see all {len(all_projects)} task(s)."
+        markup = task_list_keyboard([], can_create=allowed, page=page, pages=1,
+                                    search_term=term, can_search=False)
+    elif not term and not all_projects:
+        text = i18n.t(user_id, "nav.tasks_empty")
+        markup = task_list_keyboard([], can_create=allowed, can_search=False)
+    else:
+        header = f"🔍 “{term}” - {total} match(es)\n\n" if term else ""
+        if page_count > 1:
+            header += f"{i18n.t(user_id, 'nav.your_tasks')} (page {page}/{page_count})\n"
+        else:
+            header += i18n.t(user_id, "nav.your_tasks")
+        text = header
+        markup = task_list_keyboard(visible, can_create=allowed, page=page,
+                                    pages=page_count, search_term=term,
+                                    can_search=bool(all_projects))
+
+    return text, markup, page_count
+
+
+async def _show_task_list(message, user_id, edit=False):
+    """📁 Projects = the task list FIRST (UX-NAV-02 93.1), with an
+    empty state (Create Your First Task) when there are zero tasks,
+    and pagination + search for longer lists (Batch 4 / UX-NAV-03).
+    Rendered through nav_state.place so repeated navigation replaces
+    the previous bot screen message instead of stacking duplicates."""
+    text, markup, _pages = _task_list_payload(user_id)
     await nav_state.place(message, user_id, "tasks", text, reply_markup=markup, edit=edit)
 
 
@@ -1908,6 +2036,93 @@ async def _confirm_delete_task(message, project_id, user_id, edit=False):
 _send_my_projects = _show_task_list
 
 
+# ==========================================
+# PLAN-LOCKED STATE (Batch 4 / UX-NAV-04)
+# ==========================================
+# A gate that fails (project/source/destination cap, feature not on
+# the plan) renders a real screen: what the limit is, why, and a
+# working ⬆️ Upgrade Plan CTA that drops into the live upgrade chain -
+# instead of a bare "locked" toast with no way forward.
+
+def _locked_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬆️ Upgrade Plan", callback_data="acct:upgrade")],
+        [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+    ])
+
+
+def _locked_text(reason):
+    return f"🔒 Plan limit\n\n{reason}\n\nUpgrade to lift this limit - plans activate instantly."
+
+
+def _payment_request_line(r):
+    """One-line human description of a payment_request row across all
+    methods/purposes (plan, wallet top-up, extra-credit package)."""
+    purpose = r["purpose"] or "plan"
+    if purpose == "wallet_topup":
+        what = "💰 Wallet top-up"
+    elif purpose == "extra_credit":
+        n = int(r["extra_forwards"] or 0)
+        what = f"⚡ Extra Credits ({n:,} forwards)" if n else "⚡ Extra Credits"
+    else:
+        plan = r["plan"] or "?"
+        months = r["months"]
+        what = f"{plan}" + (f" × {months}mo" if months else "")
+    cur = r["currency"] or "INR"
+    if cur == "STARS":
+        amount = f"⭐{int(float(r['final_amount'] or 0))}"
+    elif cur == "USD":
+        amount = f"${float(r['final_amount'] or r['amount_usd'] or 0):.2f}"
+    else:
+        amount = f"₹{float(r['final_amount'] or r['amount_inr'] or 0):.0f}"
+    return f"{what} — {amount} via {r['method']}"
+
+
+_STATUS_ICON = {
+    "PENDING_PAYMENT": "⏳", "SUBMITTED": "🕓", "SUCCESS": "✅",
+    "APPROVED": "✅", "REJECTED": "❌", "CANCELLED": "🚫",
+    "EXPIRED": "⌛", "DETECTING": "🔄", "CONFIRMING": "🔄", "FAILED": "❌",
+}
+
+
+def _payment_status_label(status):
+    return f"{_STATUS_ICON.get(status, '•')} {status.replace('_', ' ').title()}"
+
+
+async def _send_payment_history(message, user_id, edit=False):
+    """📜 Payment history for the user across every method (Batch 4 /
+    PRD 24 History + 25.2 + 26 payment history). Read-only over
+    payment_requests; never shows provider secrets."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM payment_requests WHERE user_id=? ORDER BY id DESC LIMIT 10",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        text = "📜 Payment History\n\nNo payments yet. Your plan upgrades and extra-credit purchases will appear here."
+    else:
+        lines = ["📜 Payment History\n"]
+        for r in rows:
+            lines.append(f"{_payment_request_line(r)}")
+            lines.append(f"   {_payment_status_label(r['status'])} · #{r['id']} · {r['created_at'] or ''}")
+        lines.append("\nShowing the latest 10.")
+        text = "\n".join(lines)
+
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬅ Account", callback_data="nav:account"),
+            InlineKeyboardButton("🛒 Extra Credits", callback_data="credits:home"),
+        ],
+        [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+    ])
+    return await nav_state.place(message, user_id, "pay_history", text,
+                                 reply_markup=markup, edit=edit)
+
+
 def _plan_limits_text(entitlements):
     def _fmt(v):
         return "Unlimited" if v is None else str(v)
@@ -1960,13 +2175,21 @@ async def _send_plan_screen(message, user_id, edit=False):
                                      reply_markup=markup, edit=edit)
 
     used_projects = len(projects)
+    daily_cap = entitlements.get("daily_forward_limit")
+    credits = extra_credits_service.get_balance(user_id)
     text = (
         f"{_plan_limits_text(entitlements)}\n"
         f"\n"
-        f"Using: {used_projects} / {_fmt_limit(entitlements['max_projects'])} projects"
+        f"Using: {used_projects} / {_fmt_limit(entitlements['max_projects'])} projects\n"
+        f"📈 Today: {_today_global_usage(user_id)} / {_fmt_limit(daily_cap)} forwards\n"
+        f"⚡ Extra Credits: {credits:,} (used only after the daily allowance)"
     )
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬆️ Upgrade Plan", callback_data="acct:upgrade")],
+        [
+            InlineKeyboardButton("🛒 Extra Credits", callback_data="credits:home"),
+            InlineKeyboardButton("📜 History", callback_data="acct:history"),
+        ],
         [
             InlineKeyboardButton("💰 Wallet", callback_data="acct:wallet"),
             InlineKeyboardButton("👥 Rewards", callback_data="acct:earn"),
@@ -2069,7 +2292,7 @@ async def _handle_create_project(message, user_id, text):
 
     if not allowed:
         WAITING_PROJECT_NAME.pop(user_id, None)
-        await message.reply_text(f"🔒 {reason}")
+        await message.reply_text(_locked_text(reason), reply_markup=_locked_markup())
         return
 
     WAITING_PROJECT_NAME.pop(user_id, None)
@@ -2180,8 +2403,8 @@ async def _handle_add_source(message, user_id, text):
     if not allowed:
         WAITING_SOURCE.pop(user_id, None)
         await message.reply_text(
-            f"🔒 {reason}",
-            reply_markup=project_keyboard(project_id, platform_type=project["platform_type"])
+            _locked_text(reason),
+            reply_markup=_locked_markup()
         )
         return
 
@@ -2258,8 +2481,8 @@ async def _handle_add_destination(message, user_id, text):
     if not allowed:
         WAITING_DESTINATION.pop(user_id, None)
         await message.reply_text(
-            f"🔒 {reason}",
-            reply_markup=project_keyboard(project_id, platform_type=project["platform_type"])
+            _locked_text(reason),
+            reply_markup=_locked_markup()
         )
         return
 
@@ -3199,13 +3422,55 @@ async def button_handler(
             return
 
         # ======================================
+        # TASK LIST PAGINATION / SEARCH (Batch 4 / UX-NAV-03)
+        # ======================================
+
+        if action == "tasks":
+            sub = parts[1] if len(parts) > 1 else None
+            if sub == "page":
+                try:
+                    page = int(parts[2])
+                except (IndexError, ValueError):
+                    page = 1
+                _TASK_PAGE[user_id] = max(1, page)
+                await _show_task_list(query.message, user_id, edit=True)
+                return
+            if sub == "search":
+                _reset_waiting_states(user_id)
+                WAITING_TASK_SEARCH[user_id] = True
+                text = (
+                    "🔍 Search tasks\n\n"
+                    "Send a task name (or part of one) and I'll filter "
+                    "the list to matches.\n\n"
+                    "Send /cancel to abort."
+                )
+                try:
+                    await query.edit_message_text(text)
+                except Exception:
+                    await query.message.reply_text(text)
+                return
+            if sub == "clear":
+                _TASK_TERM.pop(user_id, None)
+                _TASK_PAGE.pop(user_id, None)
+                await _show_task_list(query.message, user_id, edit=True)
+                return
+            await _show_task_list(query.message, user_id, edit=True)
+            return
+
+        # ======================================
         # NEW TASK (task-list ➕ New Task)
         # ======================================
 
         if action == "newproj":
             allowed, reason = plan_service.can_create_project(user_id)
             if not allowed:
-                await query.answer(f"🔒 {reason}", show_alert=True)
+                # Batch 4 / UX-NAV-04: plan-locked state renders a
+                # screen with a working Upgrade CTA, not a bare alert.
+                await nav_state.place(
+                    query.message, user_id, "locked",
+                    _locked_text(reason),
+                    reply_markup=_locked_markup(), edit=True,
+                )
                 return
             _reset_waiting_states(user_id)
             WAITING_PROJECT_NAME[user_id] = True
@@ -3414,6 +3679,186 @@ async def button_handler(
             return
 
         # ======================================
+        # 🛒 EXTRA CREDITS HUB (Batch 4 / PRD 23 + 26)
+        # ======================================
+
+        if action == "credits":
+
+            sub = parts[1] if len(parts) > 1 else None
+
+            if sub == "home":
+                balance = extra_credits_service.get_balance(user_id)
+                lines = [
+                    "🛒 Extra Credits\n",
+                    f"Balance: ⚡ {balance:,} forward(s)\n",
+                    "Priority: your daily plan allowance is used first - "
+                    "Extra Credits are consumed only after today's "
+                    "allowance is exhausted (visible in the ledger below).",
+                ]
+                ledger = extra_credits_service.recent_ledger(user_id, limit=5)
+                if ledger:
+                    lines.append("\nRecent activity:")
+                    for row in ledger:
+                        sign = "+" if row["delta"] > 0 else ""
+                        lines.append(
+                            f"   {sign}{row['delta']:,} ({row['kind']}) "
+                            f"{row['created_at'] or ''}"
+                        )
+                else:
+                    lines.append("\nNo activity yet - buy a package to get started.")
+                lines.append("\n📦 Packages:")
+
+                buttons = []
+                for pkg in extra_credits_service.list_packages():
+                    if extra_credits_service.available_methods_for(pkg):
+                        buttons.append([InlineKeyboardButton(
+                            extra_credits_service.package_price_line(pkg),
+                            callback_data=f"credits:buy:{pkg['id']}",
+                        )])
+                buttons.append([
+                    InlineKeyboardButton("⬅ Account", callback_data="nav:account"),
+                    InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+                ])
+                await nav_state.place(query.message, user_id, "credits",
+                                      "\n".join(lines),
+                                      reply_markup=InlineKeyboardMarkup(buttons),
+                                      edit=True)
+                return
+
+            if sub == "buy":
+                package_id = int(parts[2]) if len(parts) > 2 else 0
+                pkg = extra_credits_service.get_package(package_id)
+                if pkg is None:
+                    await query.answer("⚠ Package not found.", show_alert=True)
+                    return
+                methods = extra_credits_service.available_methods_for(pkg)
+                if not methods:
+                    await query.answer(
+                        "⚠ This package has no configured price yet. "
+                        "Contact the admin.", show_alert=True)
+                    return
+                lines = [
+                    f"🛒 {extra_credits_service.package_price_line(pkg)}\n",
+                    f"⚡ {int(pkg['forwards_amount']):,} prepaid forwards, "
+                    "never expire, used only after the daily allowance.\n",
+                    "Choose how to pay:",
+                ]
+                rows = []
+                if "stars" in methods:
+                    rows.append([InlineKeyboardButton(
+                        f"⭐ Pay {int(pkg['stars_price'])} Stars (instant)",
+                        callback_data=f"credits:pay:{package_id}:stars")])
+                if "upi" in methods:
+                    rows.append([InlineKeyboardButton(
+                        f"🇮🇳 UPI ₹{float(pkg['price_inr']):.0f}",
+                        callback_data=f"credits:pay:{package_id}:upi")])
+                if "crypto" in methods:
+                    rows.append([InlineKeyboardButton(
+                        f"₿ Crypto ${float(pkg['price_usd']):.2f}",
+                        callback_data=f"credits:pay:{package_id}:crypto")])
+                rows.append([InlineKeyboardButton("⬅ Back", callback_data="credits:home")])
+                try:
+                    await query.edit_message_text("\n".join(lines),
+                                                  reply_markup=InlineKeyboardMarkup(rows))
+                except Exception:
+                    await query.message.reply_text("\n".join(lines),
+                                                   reply_markup=InlineKeyboardMarkup(rows))
+                return
+
+            if sub == "pay":
+                package_id = int(parts[2]) if len(parts) > 2 else 0
+                method = parts[3] if len(parts) > 3 else None
+                pkg = extra_credits_service.get_package(package_id)
+                if pkg is None:
+                    await query.answer("⚠ Package not found.", show_alert=True)
+                    return
+
+                if method == "stars":
+                    try:
+                        request = extra_credits_service.create_stars_package_request(
+                            user_id, package_id)
+                    except ValueError as e:
+                        await query.answer(f"⚠ {e}", show_alert=True)
+                        return
+                    total = int(float(request["final_amount"] or 0))
+                    payload = f"{stars_service.PAYLOAD_PKG}{request['id']}"
+                    description = (
+                        f"ChannelFlow Extra Credits - "
+                        f"{int(pkg['forwards_amount']):,} prepaid forwards."
+                    )
+                    try:
+                        await context.bot.send_invoice(
+                            chat_id=user_id,
+                            title=f"ChannelFlow Extra Credits ({int(pkg['forwards_amount']):,})",
+                            description=description,
+                            payload=payload,
+                            provider_token="",
+                            currency=stars_service.STARS_CURRENCY,
+                            prices=[LabeledPrice("Extra Credits", total)],
+                        )
+                    except Exception:
+                        stars_service.cancel_request(request["id"])
+                        await query.message.reply_text(
+                            "❌ Could not open the Stars checkout right now. "
+                            "Please try again shortly.")
+                        return
+                    await query.message.reply_text(
+                        "⭐ Payment sheet sent!\n\n"
+                        f"{int(pkg['forwards_amount']):,} Extra Credits are "
+                        "added the moment the payment completes. This "
+                        f"invoice expires in {stars_service.STARS_INVOICE_LIFETIME_MINUTES} minutes."
+                    )
+                    return
+
+                if method == "upi":
+                    try:
+                        request = extra_credits_service.create_offline_package_request(
+                            user_id, package_id, "upi", payment_reference=UPI_ID)
+                    except ValueError as e:
+                        await query.answer(f"⚠ {e}", show_alert=True)
+                        return
+                    amount = float(request["final_amount"] or 0)
+                    text = (
+                        f"🇮🇳 {int(pkg['forwards_amount']):,} Extra Credits "
+                        f"via UPI\n\n"
+                        f"Pay ₹{amount:.0f} to: {UPI_ID}\n"
+                        f"Name: {UPI_PAYEE_NAME or '-'}\n\n"
+                        "After paying, tap Verify and send a screenshot."
+                    )
+                else:  # crypto
+                    try:
+                        pay_link, _track = await payment_service.create_oxapay_invoice(
+                            float(pkg["price_usd"] or 0),
+                            order_id=f"u{user_id}-credits-{package_id}",
+                        )
+                    except RuntimeError as e:
+                        await query.message.reply_text(f"❌ {e}")
+                        return
+                    try:
+                        request = extra_credits_service.create_offline_package_request(
+                            user_id, package_id, "crypto", payment_reference=pay_link)
+                    except ValueError as e:
+                        await query.answer(f"⚠ {e}", show_alert=True)
+                        return
+                    amount = float(request["final_amount"] or 0)
+                    text = (
+                        f"₿ {int(pkg['forwards_amount']):,} Extra Credits "
+                        f"in crypto\n\n"
+                        f"Pay ${amount:.2f} here: {pay_link}\n\n"
+                        "After paying, tap Verify and send a screenshot."
+                    )
+
+                buttons = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Verify", callback_data=f"upgrade:verify:{request['id']}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"upgrade:cancel:{request['id']}"),
+                ]])
+                await query.message.reply_text(text, reply_markup=buttons)
+                return
+
+            await query.message.reply_text("⚠ Unknown Extra Credits action")
+            return
+
+        # ======================================
         # ACCOUNT CARD (/start screen buttons)
         # ======================================
 
@@ -3464,6 +3909,10 @@ async def button_handler(
                 ])
                 await nav_state.place(query.message, user_id, "wallet", text,
                                       reply_markup=markup, edit=True)
+                return
+
+            if sub == "history":
+                await _send_payment_history(query.message, user_id, edit=True)
                 return
 
             if sub == "connections":
@@ -3804,13 +4253,23 @@ async def button_handler(
                     await query.message.reply_text("⚠ Already decided or not ready for review.")
                     return
 
-                await query.message.reply_text(f"✅ Approved. User {approved['user_id']} is now on {approved['plan']}.")
+                await query.message.reply_text(
+                    f"✅ Approved: {_payment_request_line(approved)}."
+                )
 
-                try:
-                    await context.bot.send_message(
-                        approved["user_id"],
-                        f"✅ Your payment was approved - you're now on {approved['plan']}!"
+                if approved["purpose"] == "extra_credit":
+                    n = int(approved["extra_forwards"] or 0)
+                    user_notice = (
+                        f"✅ Your payment was approved - ⚡ {n:,} Extra "
+                        "Credits were added to your balance!"
                     )
+                else:
+                    user_notice = (
+                        f"✅ Your payment was approved - you're now on "
+                        f"{approved['plan']}!"
+                    )
+                try:
+                    await context.bot.send_message(approved["user_id"], user_notice)
                 except Exception:
                     pass
 
@@ -4032,6 +4491,17 @@ async def button_handler(
 
             _reset_waiting_states(user_id)
 
+            # Batch 4 / UX-NAV-04: gate before prompting so a user at
+            # the source cap never types a name for nothing.
+            allowed, reason = plan_service.can_add_source(user_id, project_id)
+            if not allowed:
+                await nav_state.place(
+                    query.message, user_id, "locked",
+                    _locked_text(reason),
+                    reply_markup=_locked_markup(), edit=True,
+                )
+                return
+
             CURRENT_PROJECT[user_id] = project_id
             WAITING_SOURCE[user_id] = True
 
@@ -4057,6 +4527,16 @@ async def button_handler(
                 return
 
             _reset_waiting_states(user_id)
+
+            # Batch 4 / UX-NAV-04: gate before prompting (destination cap).
+            allowed, reason = plan_service.can_add_destination(user_id, project_id)
+            if not allowed:
+                await nav_state.place(
+                    query.message, user_id, "locked",
+                    _locked_text(reason),
+                    reply_markup=_locked_markup(), edit=True,
+                )
+                return
 
             CURRENT_PROJECT[user_id] = project_id
             WAITING_DESTINATION[user_id] = True
@@ -4386,15 +4866,11 @@ async def button_handler(
             deleted_line = i18n.t(user_id, "task.deleted", name=project["name"])
 
             # Refresh the task list in the same message - empty state
-            # when the last task was just deleted (UX-NAV-02 93.2).
-            can_create, _why = plan_service.can_create_project(user_id)
-            remaining = get_projects(user_id)
-            if not remaining:
-                text = f"{deleted_line}\n\n" + i18n.t(user_id, "nav.tasks_empty")
-                markup = task_list_keyboard([], can_create=can_create)
-            else:
-                text = f"{deleted_line}\n\n" + i18n.t(user_id, "nav.your_tasks")
-                markup = task_list_keyboard(remaining, can_create=can_create)
+            # when the last task was just deleted (UX-NAV-02 93.2);
+            # pagination/search state is re-derived (Batch 4:
+            # page clamps when the last item on it disappears).
+            text, markup, _pages = _task_list_payload(user_id)
+            text = f"{deleted_line}\n\n{text}"
 
             try:
                 await query.edit_message_text(text, reply_markup=markup,
@@ -4452,6 +4928,7 @@ async def button_handler(
                 # connected-only screens stay tracked.
                 nav_state.clear_screens(user_id)
                 CURRENT_PROJECT.pop(user_id, None)
+                _clear_task_browse(user_id)
 
                 await query.message.reply_text(
                     "🔌 Disconnected. Your Telegram session was deleted. "
@@ -5330,12 +5807,15 @@ async def button_handler(
                     name = r["first_name"] or ""
                     uname = f"@{r['username']}" if r["username"] else "no username"
                     lines.append(f"#{r['id']} · {name} {uname} (ID {r['user_id']})")
-                    lines.append(f"   {r['plan']} × {r['months']}mo — ₹{r['amount_inr']:.0f} via {r['method']}")
+                    lines.append(f"   {_payment_request_line(r)}")
                     buttons.append([
                         InlineKeyboardButton(f"✅ #{r['id']}", callback_data=f"upgrade:approve:{r['id']}"),
                         InlineKeyboardButton(f"❌ #{r['id']}", callback_data=f"upgrade:reject:{r['id']}"),
                     ])
-                buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin:refresh")])
+                buttons.append([
+                    InlineKeyboardButton("📜 Full history", callback_data="admin:payhistory"),
+                    InlineKeyboardButton("🛠 Admin", callback_data="admin:refresh"),
+                ])
 
                 try:
                     await query.edit_message_text("\n".join(lines),
@@ -5343,6 +5823,44 @@ async def button_handler(
                 except Exception:
                     await query.message.reply_text("\n".join(lines),
                                                    reply_markup=InlineKeyboardMarkup(buttons))
+                return
+
+            if sub_action == "payhistory":
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT pr.*, u.username, u.first_name FROM payment_requests pr "
+                    "LEFT JOIN users u ON u.telegram_id = pr.user_id "
+                    "ORDER BY pr.id DESC LIMIT 25"
+                )
+                rows = cur.fetchall()
+                conn.close()
+
+                if not rows:
+                    await query.message.reply_text("📜 No payments recorded yet.")
+                    return
+                lines = ["📜 Payment History (latest 25)", ""]
+                for r in rows:
+                    name = r["first_name"] or ""
+                    uname = f"@{r['username']}" if r["username"] else "no username"
+                    lines.append(f"#{r['id']} · {name} {uname} (ID {r['user_id']})")
+                    lines.append(
+                        f"   {_payment_request_line(r)} — "
+                        f"{_payment_status_label(r['status'])}"
+                    )
+                lines.append("")
+                lines.append("Stars/instant payments are marked SUCCESS; "
+                             "UPI/crypto run through review.")
+                buttons = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💳 Review queue", callback_data="admin:payments"),
+                    InlineKeyboardButton("🛠 Admin", callback_data="admin:refresh"),
+                ]])
+                try:
+                    await query.edit_message_text("\n".join(lines),
+                                                  reply_markup=buttons)
+                except Exception:
+                    await query.message.reply_text("\n".join(lines),
+                                                   reply_markup=buttons)
                 return
 
             await query.message.reply_text("⚠ Unknown Admin Action")
@@ -5379,10 +5897,13 @@ async def button_handler(
 # ==========================================
 
 def _parse_stars_payload(payload):
-    """'xtr:plan:<request_id>' -> int id, else None (defensive)."""
+    """'xtr:plan:<id>' / 'xtr:pkg:<id>' -> int request id, else None.
+    The row itself (looked up afterwards) is the authority on what was
+    paid for - the prefix only selects the payload namespace."""
     try:
         parts = (payload or "").split(":")
-        if len(parts) == 3 and parts[0] == "xtr" and parts[1] == "plan":
+        if (len(parts) == 3 and parts[0] == "xtr"
+                and parts[1] in ("plan", "pkg")):
             return int(parts[2])
     except (TypeError, ValueError):
         pass
@@ -5458,16 +5979,28 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     )
 
     if reason == "ok":
-        plan = row["plan"]
-        display = plan_service.get_plan_display_name(plan)
-        await update.message.reply_text(
-            f"⭐ Payment received - welcome to {display}!\n\n"
-            f"Your {plan} plan is active for {row['months']} month(s). "
-            "You can close this receipt and head back to 📁 Projects.",
-            reply_markup=_reply_menu_for(payer_id),
-        )
-        logger.info("Stars success finalized for user=%s request=%s plan=%s",
-                    payer_id, request_id, plan)
+        if row["purpose"] == "extra_credit":
+            n = int(row["extra_forwards"] or 0)
+            await update.message.reply_text(
+                f"⭐ Payment received - ⚡ {n:,} Extra Credits added!\n\n"
+                "They never expire and are used automatically only after "
+                "your daily allowance is exhausted. See them under "
+                "Subscription → 🛒 Extra Credits.",
+                reply_markup=_reply_menu_for(payer_id),
+            )
+            logger.info("Stars extra-credit success for user=%s request=%s forwards=%s",
+                        payer_id, request_id, n)
+        else:
+            plan = row["plan"]
+            display = plan_service.get_plan_display_name(plan)
+            await update.message.reply_text(
+                f"⭐ Payment received - welcome to {display}!\n\n"
+                f"Your {plan} plan is active for {row['months']} month(s). "
+                "You can close this receipt and head back to 📁 Projects.",
+                reply_markup=_reply_menu_for(payer_id),
+            )
+            logger.info("Stars success finalized for user=%s request=%s plan=%s",
+                        payer_id, request_id, plan)
         return
 
     if reason == "expired":

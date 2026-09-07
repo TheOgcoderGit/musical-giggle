@@ -533,15 +533,30 @@ async def _dispatch(messages, route, client):
         stats_service.increment(project_id, "filtered")
         return
 
+    extra_ref = None
     if owner_id is not None:
         # Atomically check and reserve daily forward quota.
         # Uses BEGIN IMMEDIATE transaction so N concurrent forwards at
         # the limit can never all pass the check (prevents race overage).
         # Pairs with release_daily_forward() on forward failure.
         if not plan_service.reserve_daily_forward(owner_id, project_id):
-            # Daily limit reached - counted as filtered
-            stats_service.increment(project_id, "filtered")
-            return
+            # Daily allowance exhausted -> PRD 23.2 priority: fall back
+            # to the user's prepaid Extra Credits (one unit per
+            # message). Atomic + ledger-unique so concurrent forwards
+            # at zero balance never overspend and replays never
+            # double-consume. When no credits remain the message is
+            # dropped exactly like a daily-quota rejection.
+            from services import extra_credits_service
+            extra_ref = (
+                f"fwd:{project_id}:{representative.chat_id}:{representative.id}"
+            )
+            if extra_credits_service.consume(owner_id, extra_ref):
+                # Credit consumed - forwarding continues below. Usage is
+                # visible in the user's Extra Credits ledger.
+                pass
+            else:
+                stats_service.increment(project_id, "filtered")
+                return
 
     delay_min = float(settings.get("delay_min") or 0)
     delay_max = float(settings.get("delay_max") or 0)
@@ -670,14 +685,15 @@ async def _dispatch(messages, route, client):
             logger.exception("Watermark failed for project %s - sending original", project_id)
             wm_bytes = None
 
-    # The daily allowance unit for this source message was ALREADY
-    # reserved atomically near the top of _dispatch (immediately after
-    # the filters, before any transformation work). This is the single
+    # The quota unit for this source message was ALREADY reserved
+    # atomically near the top of _dispatch (immediately after the
+    # filters, before any transformation work): either one daily
+    # allowance unit or one extra credit. This is the single
     # reservation per incoming message - releasing it only happens here
-    # or at the end of the destination loop, so a message that passes
-    # the filters can never be double-reserved (PRD 22.1) and a failed
+    # at the end of the destination loop, so a message that passes the
+    # filters can never be double-reserved (PRD 22.1) and a failed
     # forward still consumes nothing.
-    daily_reserved = owner_id is not None
+    daily_reserved = owner_id is not None and extra_ref is None
 
     published_any = False
 
@@ -851,14 +867,18 @@ async def _dispatch(messages, route, client):
             dedup_service.release(ext_claim)
 
     # If every destination was a duplicate or failed before publication,
-    # return the reserved daily unit. This is quota-only; there is no
-    # wallet/per-forward charge.
-    if daily_reserved and not published_any:
+    # return the reserved unit (daily quota or extra credit). This is
+    # quota-only; there is no wallet/per-forward charge.
+    if not published_any:
         try:
-            plan_service.release_daily_forward(project_id)
+            if daily_reserved:
+                plan_service.release_daily_forward(project_id)
+            elif extra_ref is not None:
+                from services import extra_credits_service
+                extra_credits_service.refund(owner_id, extra_ref)
         except Exception:
             logger.exception(
-                "Failed to release daily quota for project %s", project_id
+                "Failed to release reserved quota for project %s", project_id
             )
 
 

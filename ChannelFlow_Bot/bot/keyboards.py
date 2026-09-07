@@ -1203,15 +1203,36 @@ FIRST_RUN_LANGUAGE_KEYBOARD = InlineKeyboardMarkup([
 # UX-NAV-02: TASK LIST / TASK DETAILS
 # ==========================================
 
-def task_list_keyboard(projects, can_create=True):
+def task_list_keyboard(projects, can_create=True, page=1, pages=1,
+                        search_term=None, can_search=True):
     """📁 Projects = task list FIRST. One row per task; selecting a
-    task opens its Task Details card. No advanced actions on this
-    screen - only what a list needs."""
+    task opens its Task Details card.
+
+    Batch 4 / UX-NAV-03 pagination + search: when the list spans more
+    than one page a prev/page/next row is emitted, and a 🔍 Search row
+    (or ✖ Clear search while a term is active) is emitted whenever the
+    user has tasks to browse. Home always stays the final row."""
     rows = []
     for i, p in enumerate(projects, start=1):
         icon = "🟢" if p["status"] else "⚪"
         label = f"{i}. {icon} {p['name'][:30]}"
         rows.append([InlineKeyboardButton(label, callback_data=f"projcard:{p['id']}")])
+
+    if pages > 1:
+        prev = [InlineKeyboardButton("◀ Prev", callback_data=f"tasks:page:{page - 1}")] \
+            if page > 1 else [InlineKeyboardButton("·", callback_data=f"tasks:page:{page}")]
+        indicator = [InlineKeyboardButton(f"• {page}/{pages}", callback_data=f"tasks:page:{page}")]
+        nxt = [InlineKeyboardButton("Next ▶", callback_data=f"tasks:page:{page + 1}")] \
+            if page < pages else [InlineKeyboardButton("·", callback_data=f"tasks:page:{page}")]
+        rows.append(prev + indicator + nxt)
+
+    if search_term is not None or (projects and can_search):
+        if search_term:
+            rows.append([InlineKeyboardButton(
+                f"✖ Clear search ({search_term[:24]})", callback_data="tasks:clear")])
+        else:
+            rows.append([InlineKeyboardButton("🔍 Search tasks", callback_data="tasks:search")])
+
     if can_create:
         rows.append([InlineKeyboardButton("➕ New Task", callback_data="newproj")])
     rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
