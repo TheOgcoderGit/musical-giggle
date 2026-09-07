@@ -857,17 +857,63 @@ def support_ticket_keyboard(ticket_id, status):
 
 
 # ---------------------------------------------------------------------------
+# ⭐ TELEGRAM STARS UPGRADE KEYBOARDS (live; PRD section 26)
+# ---------------------------------------------------------------------------
+# The Stars checkout chain: upgrade:splans (plan picker, Stars prices)
+# -> upgrade:splan:{plan} (durations) -> upgrade:sduration:{plan}:{months}
+# (confirm) -> upgrade:scheckout:{plan}:{months} (send_invoice XTR).
+# All rows use the "upgrade" prefix, which button_handler dispatches.
+
+def stars_plan_keyboard(current_plan=None):
+    """Plan picker with monthly Stars prices (DB-configured)."""
+    from services import plan_service, stars_service
+
+    rows = []
+    icons = {"BEGINNER": "🌱", "PRO": "🚀", "CREATOR": "👑"}
+    for plan in ("BEGINNER", "PRO", "CREATOR"):
+        price = stars_service.get_stars_price(plan)
+        marker = " (current)" if plan == current_plan else ""
+        if price > 0:
+            label = f"{icons[plan]} {plan_service.get_plan_display_name(plan)} — ⭐{price}/mo{marker}"
+        else:
+            label = f"{icons[plan]} {plan_service.get_plan_display_name(plan)} — not configured{marker}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"upgrade:splan:{plan}")])
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="acct:upgrade")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stars_duration_keyboard(plan):
+    """Duration picker labelled in Stars, honouring duration discounts."""
+    from services import stars_service
+
+    rows = []
+    for opt in stars_service.get_stars_options(plan):
+        label, months = opt["label"], opt["months"]
+        rows.append([InlineKeyboardButton(label, callback_data=f"upgrade:sduration:{plan}:{months}")])
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="upgrade:splans")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stars_confirm_keyboard(plan, months):
+    """Final confirmation before the Telegram payment sheet opens."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Pay with Telegram Stars", callback_data=f"upgrade:scheckout:{plan}:{months}")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"upgrade:splan:{plan}")],
+    ])
+
+
+# ---------------------------------------------------------------------------
 # UNREFERENCED LEGACY / REFERENCE-BOT KEYBOARD SECTIONS
 # ---------------------------------------------------------------------------
 # Everything below until the ADMIN KEYBOARD section was carried over
 # from the reference "Prompt 3" bot. NO live handler imports or renders
 # these builders (audited UX-NAV-02); they emit callbacks that have no
 # handler (pay:*, pacct:*, wacode:*, wallet:redeem, settings:notifications,
-# ...) and must therefore NEVER be attached to a rendered message. In
-# particular, the ⭐ Telegram Stars rows here are gated OFF: Stars
-# checkout/precheckout is not implemented, so rendering these buttons
-# would violate UX-NAV-01 92.5 ("never dead buttons"). Live payment UI
-# is the upgrade:* chain in bot/handlers.py.
+# ...) and must therefore NEVER be attached to a rendered message. The
+# ⭐ Telegram Stars rows in these legacy sections stay OFF: the live
+# Stars UI is the upgrade:splans chain above, which renders Stars rows
+# only through button_handler-dispatched callbacks (UX-NAV-01 92.5
+# "never dead buttons").
 # ---------------------------------------------------------------------------
 
 # ==========================================

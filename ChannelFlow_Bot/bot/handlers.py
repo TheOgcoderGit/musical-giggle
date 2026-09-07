@@ -33,7 +33,7 @@ import json
 import time
 from datetime import datetime, timezone
 
-from telegram import Update, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 from telegram.ext import ContextTypes
 
 from bot.keyboards import (
@@ -61,6 +61,9 @@ from bot.keyboards import (
     menu_connected_keyboard,
     FIRST_RUN_LANGUAGE_KEYBOARD,
     LANGUAGE_KEYBOARD,
+    stars_plan_keyboard,
+    stars_duration_keyboard,
+    stars_confirm_keyboard,
     task_list_keyboard,
     task_detail_keyboard,
     delete_confirm_keyboard,
@@ -120,6 +123,7 @@ from database.db import get_connection
 from config import ADMIN_IDS, INSTAGRAM_ACCESS_TOKEN
 
 from services import content_rules_service, formatting_service, plan_service, referral_service, payment_service, pricing_service, wallet_service
+from services import stars_service
 from config import UPI_ID, UPI_PAYEE_NAME
 from core import user_sessions, client_pool
 from core import session_crypto
@@ -1943,8 +1947,9 @@ async def _send_plan_screen(message, user_id, edit=False):
             price_line = f"₹{inr:.0f}/mo" if inr else ("$" + f"{usd:.2f}/mo" if usd else "—")
             lines.append(f"• {cfg.get('display_name', plan_name)} — {price_line}")
         lines.append("")
-        lines.append("⭐ Telegram Stars payments are not available yet - "
-                     "subscribe via UPI or crypto after connecting.")
+        lines.append("⭐ Telegram Stars, UPI, and crypto are all available - "
+                     "connect your Telegram account first, then upgrade "
+                     "instantly with Stars from the Plan screen.")
         lines.append("")
         lines.append("Connect your Telegram account first, then upgrade from here.")
         markup = InlineKeyboardMarkup([
@@ -3497,7 +3502,19 @@ async def button_handler(
                 entitlements = plan_service.get_entitlements(user_id)
                 buttons = []
 
-                for plan_name, price in payment_service.PLAN_PRICES.items():
+                # ⭐ Telegram Stars (PRD section 26): instant in-app
+                # checkout; every price is DB-configured.
+                buttons.append([InlineKeyboardButton(
+                    "⭐ Telegram Stars (instant)", callback_data="upgrade:splans"
+                )])
+
+                # UPI/crypto plan prices come from the DB USD price book
+                # (plan_service) - payment_service.PLAN_PRICES never
+                # existed and would AttributeError here.
+                for plan_name in ("BEGINNER", "PRO", "CREATOR"):
+                    price = plan_service.get_plan_crypto_price_usd(plan_name)
+                    if not price:
+                        continue
                     marker = " (current)" if plan_name == entitlements["plan"] else ""
                     buttons.append([InlineKeyboardButton(
                         f"{plan_name} - ${price}/mo{marker}", callback_data=f"upgrade:plan:{plan_name}"
@@ -3538,6 +3555,117 @@ async def button_handler(
         if action == "upgrade":
 
             sub = parts[1] if len(parts) > 1 else None
+
+            # ======================================
+            # ⭐ TELEGRAM STARS CHAIN (PRD section 26)
+            # upgrade:splans -> splan -> sduration -> scheckout
+            # ======================================
+
+            if sub == "splans":
+                entitlements = plan_service.get_entitlements(user_id)
+                current = entitlements["plan"]
+                text = (
+                    "⭐ Telegram Stars\n\n"
+                    "Pay instantly inside Telegram - no screenshots, no "
+                    "manual review. Choose a plan:"
+                )
+                try:
+                    await query.edit_message_text(
+                        text, reply_markup=stars_plan_keyboard(current_plan=current)
+                    )
+                except Exception:
+                    await query.message.reply_text(
+                        text, reply_markup=stars_plan_keyboard(current_plan=current)
+                    )
+                return
+
+            if sub == "splan":
+                plan = parts[2] if len(parts) > 2 else None
+                text = f"⭐ {plan}\n\nChoose a duration:"
+                try:
+                    await query.edit_message_text(
+                        text, reply_markup=stars_duration_keyboard(plan)
+                    )
+                except Exception:
+                    await query.message.reply_text(
+                        text, reply_markup=stars_duration_keyboard(plan)
+                    )
+                return
+
+            if sub == "sduration":
+                plan, months = parts[2], int(parts[3])
+                try:
+                    total, discount, full = stars_service.invoice_details_for(plan, months)
+                except ValueError as e:
+                    await query.answer(f"⚠ {e}", show_alert=True)
+                    return
+                price_line = f"⭐{total}"
+                if discount > 0:
+                    price_line += f"  (was ⭐{full}, save {discount:.0f}%)"
+                text = (
+                    f"⭐ {plan} · {months} mo\n\n"
+                    f"Total: {price_line}\n\n"
+                    "Your plan activates instantly after payment. Tap below "
+                    "to open the Telegram payment sheet."
+                )
+                try:
+                    await query.edit_message_text(
+                        text, reply_markup=stars_confirm_keyboard(plan, months)
+                    )
+                except Exception:
+                    await query.message.reply_text(
+                        text, reply_markup=stars_confirm_keyboard(plan, months)
+                    )
+                return
+
+            if sub == "scheckout":
+                plan, months = parts[2], int(parts[3])
+
+                # Local snapshot row first (local row -> provider order
+                # reference, same discipline as the crypto flow).
+                try:
+                    request = stars_service.create_plan_invoice_row(user_id, plan, months)
+                except ValueError as e:
+                    await query.answer(f"⚠ {e}", show_alert=True)
+                    return
+
+                total = int(float(request["final_amount"] or 0))
+                payload = f"{stars_service.PAYLOAD_PLAN}{request['id']}"
+
+                description = f"ChannelFlow {plan} subscription - {months} month(s)."
+                discount = int(float(request["discount_percent"] or 0))
+                if discount > 0:
+                    description += f" Includes a {discount:.0f}% duration discount."
+
+                try:
+                    await context.bot.send_invoice(
+                        chat_id=user_id,
+                        title=f"ChannelFlow {plan} - {months} mo",
+                        description=description,
+                        payload=payload,
+                        provider_token="",
+                        currency=stars_service.STARS_CURRENCY,
+                        prices=[LabeledPrice(f"{plan} {months} mo", total)],
+                    )
+                except Exception:
+                    stars_service.cancel_request(request["id"])
+                    await query.message.reply_text(
+                        "❌ Could not open the Stars checkout right now. "
+                        "Please try again shortly."
+                    )
+                    return
+
+                await query.message.reply_text(
+                    "⭐ Payment sheet sent!\n\n"
+                    "Complete the payment inside Telegram and your plan "
+                    "activates instantly. This invoice expires in "
+                    f"{stars_service.STARS_INVOICE_LIFETIME_MINUTES} minutes."
+                )
+                return
+
+            # ======================================
+            # LEGACY/UPI/CRYPTO CHAIN (method-first, admin-reviewed)
+            # ======================================
 
             if sub == "plan":
 
@@ -5243,3 +5371,121 @@ async def button_handler(
             query,
             "⚠ Something went wrong while processing that action. Please try again."
         )
+
+
+# ==========================================
+# ⭐ TELEGRAM STARS - PRE-CHECKOUT + SUCCESS
+# (PRD section 26; registered in main.py)
+# ==========================================
+
+def _parse_stars_payload(payload):
+    """'xtr:plan:<request_id>' -> int id, else None (defensive)."""
+    try:
+        parts = (payload or "").split(":")
+        if len(parts) == 3 and parts[0] == "xtr" and parts[1] == "plan":
+            return int(parts[2])
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Answers Telegram's pre_checkout_query for Stars invoices.
+
+    Security checks before we let Telegram charge the user:
+      * payload must be our xtr:plan:<id> namespace;
+      * the request row must exist, belong to this user, and still be
+        PENDING_PAYMENT;
+      * the invoice must not have expired on our clock;
+      * Telegram's reported total_amount must equal the DB snapshot.
+
+    Any failure answers ok=False and Telegram shows the error message
+    without charging (no refund needed at this stage)."""
+    q = update.pre_checkout_query
+    if q is None:
+        return
+
+    user_id = q.from_user.id
+    request_id = _parse_stars_payload(q.invoice_payload)
+
+    if request_id is None:
+        await q.answer(False, error_message="Unrecognized invoice. Please start a fresh checkout.")
+        return
+
+    row = stars_service.get_request(request_id)
+
+    if row is None or row["method"] != "stars" or int(row["user_id"]) != int(user_id):
+        await q.answer(False, error_message="This invoice is not valid for your account. Start a fresh checkout.")
+        return
+
+    if row["status"] != "PENDING_PAYMENT":
+        await q.answer(False, error_message="This invoice was already used or expired. Start a fresh checkout.")
+        return
+
+    if q.currency != stars_service.STARS_CURRENCY or \
+       int(q.total_amount or 0) != int(float(row["final_amount"] or 0)):
+        logger.warning("Stars pre-checkout mismatch: user=%s payload=%s currency=%s total=%s",
+                       user_id, q.invoice_payload, q.currency, q.total_amount)
+        await q.answer(False, error_message="Amount mismatch. Start a fresh checkout.")
+        return
+
+    await q.answer(True)
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram reported a successful Stars payment.
+
+    The money is only converted into a plan here after
+    stars_service.resolve_stars_success() re-validates ownership,
+    idempotency, expiry and the exact Stars amount (never trust the
+    client; duplicates and stale replays are no-ops)."""
+    sp = update.message.successful_payment if update.message else None
+    if sp is None:
+        return
+
+    request_id = _parse_stars_payload(sp.invoice_payload)
+    if request_id is None:
+        await update.message.reply_text(
+            "⚠ We couldn't match this payment to an invoice. Your Stars "
+            "will be refunded automatically by Telegram - contact Support "
+            "if that doesn't happen within a few minutes."
+        )
+        return
+
+    payer_id = sp.from_user.id if sp.from_user else update.effective_user.id
+    row, reason = stars_service.resolve_stars_success(
+        request_id, payer_id, sp.total_amount
+    )
+
+    if reason == "ok":
+        plan = row["plan"]
+        display = plan_service.get_plan_display_name(plan)
+        await update.message.reply_text(
+            f"⭐ Payment received - welcome to {display}!\n\n"
+            f"Your {plan} plan is active for {row['months']} month(s). "
+            "You can close this receipt and head back to 📁 Projects.",
+            reply_markup=_reply_menu_for(payer_id),
+        )
+        logger.info("Stars success finalized for user=%s request=%s plan=%s",
+                    payer_id, request_id, plan)
+        return
+
+    if reason == "expired":
+        await update.message.reply_text(
+            "⚠ Your Stars payment arrived after this invoice expired. "
+            "Telegram refunds the Stars to your account automatically - "
+            "please start a fresh checkout, or contact Support if the "
+            "refund doesn't appear."
+        )
+        return
+
+    # already_decided / amount_mismatch / not_owner / not_found /
+    # not_stars: never grant anything; Telegram refunds invalid charges.
+    logger.warning("Stars success refused: user=%s request=%s reason=%s",
+                   payer_id, request_id, reason)
+    await update.message.reply_text(
+        "⚠ We couldn't process this payment (it may be a duplicate or an "
+        "expired invoice). No plan was changed. Telegram refunds invalid "
+        "Stars automatically - contact Support if you were charged and "
+        "nothing changed."
+    )

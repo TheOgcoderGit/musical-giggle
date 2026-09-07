@@ -8,6 +8,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    PreCheckoutQueryHandler,
     filters
 )
 
@@ -29,7 +30,9 @@ from bot.handlers import (
     unknown_command_handler,
     walletadjust_command,
     menu_handler,
-    button_handler
+    button_handler,
+    pre_checkout_handler,
+    successful_payment_handler
 )
 from bot.admin_promo_handlers import post_command, broadcast_command, handle_promo_media
 from bot.admin_panel import admin_dashboard, admin_callback, _render_user_profile
@@ -199,6 +202,15 @@ app.add_handler(
 app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
 
 app.add_handler(CallbackQueryHandler(button_handler))
+
+# ⭐ Telegram Stars checkout (PRD section 26): pre_checkout_query is
+# answered defensively (ok=False unless the snapshot row + amount both
+# verify); successful_payment finalizes the plan exactly once through
+# services/stars_service (ownership, expiry, price-match, replay guard).
+app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+app.add_handler(
+    MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler)
+)
 
 app.add_error_handler(error_handler)
 

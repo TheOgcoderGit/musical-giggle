@@ -441,6 +441,11 @@ DISPLAYED_KEYBOARD_FUNCS = [
     "project_keyboard",
     "account_card_keyboard",
     "settings_keyboard",
+    # ⭐ Telegram Stars upgrade chain (PRD section 26; live since
+    # Batch 3 - rows emit only the handled "upgrade" prefix)
+    "stars_plan_keyboard",
+    "stars_duration_keyboard",
+    "stars_confirm_keyboard",
 ]
 
 DISPLAYED_KEYBOARD_CONSTS = [

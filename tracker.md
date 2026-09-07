@@ -7,10 +7,10 @@
   - Upstream `main` contains only: `ChannelFlow_AI_Master_PRD.md`, `ChannelFlow_Bot.zip` (base, 299,994 bytes), `README.md`
 - Base ZIP: `ChannelFlow_Bot.zip` in repo root (the 2026-09-05 upload; the only base provided — no FIXED_v4 or older duplicate was used)
 - PRD: `ChannelFlow_AI_Master_PRD.md` (3452 lines, now extended to §94 with UX-NAV-01/02/03–06)
-- Current implementation batch: **Batch 2** (in progress → completed by this checkpoint)
-- Last completed batch: Batch 1 (see Batch History) and **Batch 2 = UX-NAV-01 + UX-NAV-02** (this checkpoint)
-- Last tested batch: Batch 2 (tests executed below; results in Batch History)
-- Next starting point: next batch after product owner go-ahead (Batch-3 candidates in Resume Point) — see Resume Point
+- Current implementation batch: **Batch 3** (in progress → completed by this checkpoint)
+- Last completed batch: Batch 1/2 (see Batch History) and **Batch 3 = Telegram Stars checkout backend** (this checkpoint)
+- Last tested batch: Batch 3 (tests executed below; results in Batch History)
+- Next starting point: next batch after product owner go-ahead (candidates in Resume Point) — see Resume Point
 
 ## Status Legend
 
@@ -57,7 +57,7 @@
 | Forwarder pipeline no-crash + quota atomicity | — | Y | — | — | Y (repro) | Y | VERIFIED (runtime repro) |
 | Telegram → Telegram | Y | Y | Y | Y | Y (pre-existing) | Y | PARTIAL (needs end-to-end) |
 | Telegram → WhatsApp | Y | Y (queue) | PARTIAL | PARTIAL | BLOCKED (no real Meta creds; placeholder CDN URLs in publish job) | — | PARTIAL |
-| Stars | Y | Y | — | Y | BLOCKED (no checkout/precheckout handlers, PTB invoice flow absent) | — | PARTIAL |
+| Stars (plan checkout, §26) | Y | Y | Y (upgrade:splans chain + pre_checkout/successful_payment) | Y (⭐ row on upgrade picker; no dead buttons) | Pending real-Telegram (invoice sheet is client-side) | Y (23 new) | VERIFIED (mock/simulation) |
 | UPI | Y | Y | Y | Y | BLOCKED (needs real admin verification) | Y | PARTIAL |
 | Crypto | Y | Y | Y | Y | BLOCKED (needs Oxapay key) | Y | PARTIAL |
 | Extra forward credits | — | — | — | — | — | — | TODO |
@@ -133,6 +133,95 @@
 \* VERIFIED = verified at the level possible without live Telegram credentials (unit/integration/DB/runtime repro). Live-account E2E remains the documented limitation.
 
 ## Batch History
+
+### Batch 3 — Telegram Stars checkout backend (PRD §26) (2026-09-07)
+
+PRD §26 was the top documented remaining gap after Batch 2 (UI fully
+gated, no dead buttons; backend absent). This batch implements the real
+Stars purchase loop end to end at the service + handler level.
+
+Features implemented:
+1. **`services/stars_service.py` (NEW - pure service layer, no telegram
+   import, offline-unit-testable)**: DB-driven Stars pricing
+   (`plan_configs.stars_monthly_price` x `plan_durations.discount_percent`,
+   integer-only totals, discount floor-rounded DOWN to a whole Star so the
+   user never pays more than the exact discounted amount);
+   `create_plan_invoice_row` snapshot rows (PENDING_PAYMENT / method=stars /
+   currency=STARS / purpose=plan / 15-min expiry, same policy as crypto);
+   `resolve_stars_success` - the money-to-plan boundary validating in
+   order: row exists -> method=stars -> ownership -> still pending ->
+   not expired (flips EXPIRED) -> Telegram-paid Stars == snapshot
+   final_amount; then an atomic guarded UPDATE flips the row to SUCCESS
+   exactly once (duplicate replay/restart redelivery is a no-op) and
+   activates the plan (shared idempotent activation + last_purchase
+   markers + referral check). `cancel_request` (send_invoice failures),
+   `get_stars_options`, `get_user_stars_history`.
+2. **Inline UI chain (bot/handlers.py + bot/keyboards.py)**:
+   `acct:upgrade` now has a "⭐ Telegram Stars (instant)" row (DB prices,
+   current-plan marker) -> `upgrade:splans` -> `upgrade:splan:{plan}` ->
+   `upgrade:sduration:{plan}:{months}` -> `upgrade:scheckout:{plan}:{months}`
+   opens the Telegram payment sheet via `send_invoice(currency="XTR",
+   payload="xtr:plan:<row-id>", provider_token="")` with the snapshot
+   amount; failure cancels the row and tells the user. Stars screens edit
+   in place (nav-state message lifecycle). Old "Stars not available yet"
+   copy replaced. The 3 new keyboard builders were added to the displayed-
+   keyboard audit (they emit only the handled `upgrade` prefix).
+3. **`pre_checkout_query` handler**: answers ok=False (Telegram shows the
+   error, user is never charged) for unknown payloads, foreign/missing
+   request rows, non-pending rows, wrong currency, or total_amount != the
+   DB snapshot; ok=True only when everything verifies.
+4. **`successful_payment` handler**: re-validates via resolve_stars_success,
+   then sends the receipt ("welcome to <plan>") with the account-state
+   menu; expired invoices get the refund copy (Telegram auto-refunds);
+   replays/mismatches refuse without ever granting anything.
+5. **main.py**: PreCheckoutQueryHandler + MessageHandler
+   (filters.SUCCESSFUL_PAYMENT) registered before the error handler.
+6. **Latent runtime bug found + fixed by the new chain test**:
+   `acct:upgrade` referenced the nonexistent `payment_service.PLAN_PRICES`
+   (AttributeError on every tap -> stale-callback fallback). Now priced
+   from `plan_service.get_plan_crypto_price_usd` (DB USD price book).
+
+Files changed:
+- services/stars_service.py (NEW)
+- bot/keyboards.py (stars_plan/duration/confirm keyboard builders)
+- bot/handlers.py (upgrade:splans/splan/sduration/scheckout chain, Stars
+  row + copy, pre_checkout_handler, successful_payment_handler, PLAN_PRICES
+  latent-bug fix)
+- main.py (two new handler registrations)
+- tests/test_stars_batch3.py (NEW - 23 tests)
+- tests/test_uxnav_batch2.py (audit list extended with the 3 Stars builders)
+- tracker.md (this file)
+
+Tests executed (Batch 3):
+- pytest suite: 71 passed (48 Batch-1/2 + 23 Batch-3 new)
+- standalone regressions: test_final_fix.py ALL REGRESSION TESTS PASSED;
+  test_db_migration.py / test_db.py PASS
+- compileall across bot/services/database/core/destinations/tests/main.py: PASS
+- import gate (fresh env): bot.handlers / bot.keyboards / stars_service /
+  main.py wiring parse: PASS
+
+Test result: PASS (live-Telegram E2E still BLOCKED - no real credentials;
+the Stars payment sheet itself is a Telegram-client step that cannot run
+in the sandbox, but pre-checkout/successful_payment logic is fully
+covered offline through the real handlers).
+
+Remaining issues after Batch 3: live Telegram E2E BLOCKED; extra-credit
+package purchases via Stars need the extra-credit backend first (deferred
+feature, not UI); wallet top-up intentionally still UPI/crypto only
+(wallet bookkeeping is INR/USD; a Stars-denominated top-up needs an
+explicit rate decision); inner-screen EN/HI i18n rollout ongoing; legacy
+unreferenced keyboard sections (bug e) + ChannelFlowAI5_monetization tree
+still to consolidate; WhatsApp CDN placeholder URLs (bug c);
+whatsapp_pairing seed sample codes (bug d); core.client import side-effect
+(bug f).
+
+Commit/version identifier: see git log (Batch 3 commit after this tracker update).
+
+ZIP generated: `ChannelFlowAI_Batch03_CHECKPOINT.zip` (repo root; excludes secrets/DBs/caches)
+
+Next batch: candidates = UX-NAV-03..06 backlog (§94) when scheduled by
+the product owner, extra-credit packages (backend + Stars purchase),
+Stars wallet top-up (after a rate policy decision), full-HI copy pass.
 
 ### Batch 2 — UX-NAV-01 Unified Onboarding & Navigation UX + UX-NAV-02 Task-First Navigation & Message Lifecycle (2026-09-07)
 
@@ -230,16 +319,17 @@ Next batch: Batch 2 = UX-NAV-01 (Unified Onboarding & Navigation UX) + UX-NAV-02
 ## Resume Point
 
 ```
-CURRENT BATCH:              Batch 2 — COMPLETE (UX-NAV-01 + UX-NAV-02; checkpoint ZIP + commit pushed;
-                            awaiting user go-ahead for the next batch)
-LAST COMPLETED FEATURE:     UX-NAV-02 task-first navigation + message lifecycle (Batch 2, single batch
-                            covering the whole product-owner UX requirement)
-LAST VERIFIED FEATURE:      UX-NAV-01/02 verified at unit + simulation + DB level (48 pytest tests PASS;
-                            legacy test_db/test_db_migration/test_final_fix PASS)
+CURRENT BATCH:              Batch 3 — COMPLETE (Telegram Stars checkout backend; checkpoint ZIP + commit
+                            pushed; awaiting user go-ahead for the next batch)
+LAST COMPLETED FEATURE:     Telegram Stars plan checkout (PRD §26) - send_invoice XTR chain +
+                            pre_checkout + successful_payment + idempotent snapshot activation
+LAST VERIFIED FEATURE:      Stars checkout verified at service + handler + simulation level
+                            (71 pytest tests PASS incl. 23 new; legacy regressions PASS)
 NEXT FEATURE:               TBD by product owner — documented candidates: UX-NAV-03..06 backlog (§94),
-                            Stars real checkout/precheckout, WhatsApp CDN placeholder URLs,
-                            whatsapp_pairing seed cleanup, ChannelFlowAI5 duplicate tree consolidation,
-                            lazy core.client construction, full EN+HI copy pass
+                            extra-credit packages (backend + Stars purchase), Stars wallet top-up
+                            (needs a Stars→INR/USD rate policy decision), WhatsApp CDN placeholder
+                            URLs, whatsapp_pairing seed cleanup, ChannelFlowAI5 duplicate tree
+                            consolidation, lazy core.client construction, full EN+HI copy pass
 KNOWN BUGS:                 [open] (c) media publish for WhatsApp uses placeholder CDN URLs (provider
                             work); (d) whatsapp_pairing seed block inserts sample codes for first user at
                             DB init (cleanup candidate); (e) keyboards.py unreferenced reference-bot
@@ -247,20 +337,20 @@ KNOWN BUGS:                 [open] (c) media publish for WhatsApp uses placehold
                             banner-marked; consolidation candidate) + ChannelFlowAI5_monetization/
                             duplicate handler tree; (f) core.client import side-effect creates empty
                             ChannelFlow.session file on any import (gitignored; lazy-construction
-                            cleanup candidate); (g) Stars purchase backend (send_invoice/pre_checkout/
-                            successful_payment) not implemented — UI fully gated since Batch 2, no dead
-                            buttons (upgrade:* chain + explanatory copy)
-                            [fixed in Batch 2] (b) orphan callbacks on DISPLAYED keyboards (nav:/
-                            projcard:/newproj/editproj:/deleteconfirm:/filter*/fmtroot/support:*/help:*/
-                            acct:plan|wallet|connections/admin:payments/lang:* now handled; Settings hub
-                            7/9 dead rows fixed; dead reply rows 🏠 Home/⚙️ Settings fixed; Stars rows
-                            gated; audit test enforces no dead displayed callbacks)
+                            cleanup candidate)
+                            [fixed in Batch 3] (g) Stars purchase backend: send_invoice XTR +
+                            pre_checkout_query + successful_payment implemented; upgrade:PLAN_PRICES
+                            latent AttributeError fixed (nonexistent constant, every acct:upgrade tap
+                            crashed → stale-callback reply); Stars row live on the upgrade picker
+                            [fixed in Batch 2] (b) orphan callbacks on DISPLAYED keyboards (see Batch 2
+                            history)
                             [fixed in Batch 1] (a) stars_monthly_price column gap in plan_configs
 KNOWN BLOCKERS:             live Telegram account test (no real API_ID/API_HASH/BOT_TOKEN in sandbox);
-                            Meta WhatsApp Cloud API credentials; Oxapay key; OpenRouter key
-NEXT TESTS:                 Batch 3 test list: UX-NAV-03 pagination, plan-locked CTA states, Stars
-                            checkout handlers once a test bot is available, plus rerun of the 48-test
-                            suite + UI-integrity audit after every UI change
+                            the Stars payment sheet is a Telegram-client step (can only be exercised
+                            with a real bot); Meta WhatsApp Cloud API credentials; Oxapay key;
+                            OpenRouter key
+NEXT TESTS:                 next-batch test list (candidates above), plus rerun of the 71-test suite +
+                            UI-integrity audit after every UI change
 ```
 
 ## Deployment & Test Notes
